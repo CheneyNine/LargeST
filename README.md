@@ -51,7 +51,7 @@ python generate_data_for_training.py --dataset gla --years 2019
 
 
 ## 2. Experiments Running
-We conduct experiments on an Intel(R) Xeon(R) Gold 6140 CPU @ 2.30 GHz, 376 GB RAM computing server, equipped with an NVIDIA RTX A6000 GPU with 48 GB memory. We adopt PyTorch 1.12 as the default deep learning library. Currently, there are a total of 12 supported baselines in this repository, namely, Historical Last (HL), LSTM, [DCRNN](https://github.com/chnsh/DCRNN_PyTorch), [AGCRN](https://github.com/LeiBAI/AGCRN), [STGCN](https://github.com/hazdzz/STGCN), [GWNET](https://github.com/nnzhan/Graph-WaveNet), [ASTGCN](https://github.com/guoshnBJTU/ASTGCN-r-pytorch), [STTN](https://github.com/xumingxingsjtu/STTN), [STGODE](https://github.com/square-coder/STGODE), [DSTAGNN](https://github.com/SYLan2019/DSTAGNN), [DGCRN](https://github.com/tsinghua-fib-lab/Traffic-Benchmark/tree/master/methods/DGCRN), and [D2STGNN](https://github.com/zezhishao/D2STGNN).
+We conduct experiments on an Intel(R) Xeon(R) Gold 6140 CPU @ 2.30 GHz, 376 GB RAM computing server, equipped with an NVIDIA RTX A6000 GPU with 48 GB memory. We adopt PyTorch 1.12 as the default deep learning library. Currently, there are a total of 13 supported baselines in this repository, namely, Historical Last (HL), LSTM, [DCRNN](https://github.com/chnsh/DCRNN_PyTorch), [AGCRN](https://github.com/LeiBAI/AGCRN), [STGCN](https://github.com/hazdzz/STGCN), [GWNET](https://github.com/nnzhan/Graph-WaveNet), [ASTGCN](https://github.com/guoshnBJTU/ASTGCN-r-pytorch), [STTN](https://github.com/xumingxingsjtu/STTN), [STGODE](https://github.com/square-coder/STGODE), [DSTAGNN](https://github.com/SYLan2019/DSTAGNN), [DGCRN](https://github.com/tsinghua-fib-lab/Traffic-Benchmark/tree/master/methods/DGCRN), [D2STGNN](https://github.com/zezhishao/D2STGNN), and E2-CSTP.
 
 To reproduce the benchmark results in the manuscript, please go to `experiments/baseline_you_want_to_run`, open the provided `run.sh` file, and uncomment the line you would like to execute. Note that you may need to specify the GPU card number on your server. Moreover, we use the flow data from 2019 for model training in our manuscript, if you want to use multiple years of data, please change the years argument to, e.g., 2018_2019.
 
@@ -63,6 +63,21 @@ or directly execute the Python file in the terminal:
 ```
 python experiments/lstm/main.py --device cuda:2 --dataset SD --years 2019 --model_name lstm --seed 2023 --bs 64
 ```
+
+To run the E2-CSTP reproduction in the original LargeST single-modal setting, you may execute:
+```
+python experiments/e2cstp/main.py --device cuda:0 --dataset SD --years 2019 --model_name e2cstp --seed 2023 --bs 64 --input_dim 3 --st_dim 3 --text_dim 0 --image_dim 0
+```
+
+For aligned multi-modal inputs, keep using the same `his.npz` file format and append the extra text/image channels to the feature dimension. Then set:
+```
+input_dim = st_dim + text_dim + image_dim
+```
+For example, if each timestamp-node pair has 3 traffic features, 8 text features, and 8 image features, use:
+```
+python experiments/e2cstp/main.py --device cuda:0 --dataset SD --years 2019 --model_name e2cstp --seed 2023 --bs 32 --input_dim 19 --st_dim 3 --text_dim 8 --image_dim 8
+```
+The current implementation keeps the repository dependency-free: the paper's causal adjacency estimation is approximated with an EMA-updated node-importance scorer over the prior road graph, while the cross-modal fusion, causal intervention branch, and GCN + Mamba-style spatio-temporal encoder are implemented directly.
 
 
 ## 3. Evaluate Your Model in Three Steps
