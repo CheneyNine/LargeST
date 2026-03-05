@@ -51,7 +51,7 @@ python generate_data_for_training.py --dataset gla --years 2019
 
 
 ## 2. Experiments Running
-We conduct experiments on an Intel(R) Xeon(R) Gold 6140 CPU @ 2.30 GHz, 376 GB RAM computing server, equipped with an NVIDIA RTX A6000 GPU with 48 GB memory. We adopt PyTorch 1.12 as the default deep learning library. Currently, there are a total of 14 supported baselines in this repository, namely, Historical Last (HL), LSTM, [DCRNN](https://github.com/chnsh/DCRNN_PyTorch), [AGCRN](https://github.com/LeiBAI/AGCRN), [STGCN](https://github.com/hazdzz/STGCN), [GWNET](https://github.com/nnzhan/Graph-WaveNet), [ASTGCN](https://github.com/guoshnBJTU/ASTGCN-r-pytorch), [STTN](https://github.com/xumingxingsjtu/STTN), [STGODE](https://github.com/square-coder/STGODE), [DSTAGNN](https://github.com/SYLan2019/DSTAGNN), [DGCRN](https://github.com/tsinghua-fib-lab/Traffic-Benchmark/tree/master/methods/DGCRN), [D2STGNN](https://github.com/zezhishao/D2STGNN), E2-CSTP, and TimeCMA.
+We conduct experiments on an Intel(R) Xeon(R) Gold 6140 CPU @ 2.30 GHz, 376 GB RAM computing server, equipped with an NVIDIA RTX A6000 GPU with 48 GB memory. We adopt PyTorch 1.12 as the default deep learning library. Currently, there are a total of 16 supported baselines in this repository, namely, Historical Last (HL), LSTM, [DCRNN](https://github.com/chnsh/DCRNN_PyTorch), [AGCRN](https://github.com/LeiBAI/AGCRN), [STGCN](https://github.com/hazdzz/STGCN), [GWNET](https://github.com/nnzhan/Graph-WaveNet), [ASTGCN](https://github.com/guoshnBJTU/ASTGCN-r-pytorch), [STTN](https://github.com/xumingxingsjtu/STTN), [STGODE](https://github.com/square-coder/STGODE), [DSTAGNN](https://github.com/SYLan2019/DSTAGNN), [DGCRN](https://github.com/tsinghua-fib-lab/Traffic-Benchmark/tree/master/methods/DGCRN), [D2STGNN](https://github.com/zezhishao/D2STGNN), E2-CSTP, TimeCMA, CrossTrafficLLM, and STEVE.
 
 To reproduce the benchmark results in the manuscript, please go to `experiments/baseline_you_want_to_run`, open the provided `run.sh` file, and uncomment the line you would like to execute. Note that you may need to specify the GPU card number on your server. Moreover, we use the flow data from 2019 for model training in our manuscript, if you want to use multiple years of data, please change the years argument to, e.g., 2018_2019.
 
@@ -93,6 +93,34 @@ For example, with 3 traffic channels and 64 prompt channels:
 python experiments/timecma/main.py --device cuda:0 --dataset SD --years 2019 --model_name timecma --seed 2023 --bs 16 --input_dim 67 --ts_dim 3 --prompt_dim 64 --prompt_hidden 128 --prompt_pool mean
 ```
 This repository version keeps the TimeCMA dual-branch encoding and cross-modal alignment, but adapts the model to LargeST's single-tensor dataloader by pooling prompt channels over time into one embedding per node. Since TimeCMA uses node-wise attention, it is best validated on smaller subsets such as SD first.
+
+To run the CrossTrafficLLM adaptation for numeric traffic forecasting only, you may execute:
+```
+python experiments/crosstrafficllm/main.py --device cuda:0 --dataset SD --years 2019 --model_name crosstrafficllm --seed 2023 --bs 16 --input_dim 3 --traffic_dim 3 --text_dim 0
+```
+
+To use aligned text embeddings, append them to the feature dimension of `his.npz` and set:
+```
+input_dim = traffic_dim + text_dim
+```
+For example, with 3 traffic channels and 32 text embedding channels:
+```
+python experiments/crosstrafficllm/main.py --device cuda:0 --dataset SD --years 2019 --model_name crosstrafficllm --seed 2023 --bs 8 --input_dim 35 --traffic_dim 3 --text_dim 32 --hidden_dim 64 --text_hidden 64
+```
+
+The current CrossTrafficLLM adaptation keeps a text-guided adaptive graph encoder, sparse cross-modal alignment, a TextCrossformer-style prediction backbone, and an optional interpretable report-generation head. To train the report head, place sample-aligned integer token targets in:
+```
+data/<dataset>/<year>/report_train.npy
+data/<dataset>/<year>/report_val.npy
+data/<dataset>/<year>/report_test.npy
+```
+and set `--report_vocab_size > 0`. If these files are absent, the model automatically falls back to traffic prediction only. Since this version is adapted to the existing LargeST data pipeline, it should be treated as a repository-compatible implementation rather than an official reproduction of the original CrossTrafficLLM codebase.
+
+To run the STEVE adaptation, you may execute:
+```
+python experiments/steve/main.py --device cuda:0 --dataset SD --years 2019 --model_name steve --seed 2023 --bs 16 --input_dim 3 --traffic_dim 3 --embed_dim 64
+```
+This repository version keeps STEVE's dual-branch robust prediction design and basis-bank confounder extractor, while adapting auxiliary supervision to LargeST's single-tensor dataloader.
 
 
 ## 3. Evaluate Your Model in Three Steps

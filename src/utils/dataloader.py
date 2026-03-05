@@ -56,8 +56,8 @@ class DataLoader(object):
                 y = np.frombuffer(y_shared, dtype='f').reshape(y_shape)
 
                 array_size = len(idx_ind)
-                num_threads = len(idx_ind) // 2
-                chunk_size = array_size // num_threads
+                num_threads = max(1, len(idx_ind) // 2)
+                chunk_size = max(1, array_size // num_threads)
                 threads = []
                 for i in range(num_threads):
                     start_index = i * chunk_size
@@ -70,6 +70,72 @@ class DataLoader(object):
                     thread.join()
 
                 yield (x, y)
+                self.current_ind += 1
+
+        return _wrapper()
+
+
+class DataLoaderWithReport(DataLoader):
+    def __init__(self, data, idx, seq_len, horizon, bs, logger, report_targets=None, pad_last_sample=False):
+        if report_targets is not None and pad_last_sample:
+            num_padding = (bs - (len(idx) % bs)) % bs
+            if num_padding > 0:
+                report_padding = np.repeat(report_targets[-1:], num_padding, axis=0)
+                report_targets = np.concatenate([report_targets, report_padding], axis=0)
+        super(DataLoaderWithReport, self).__init__(
+            data=data,
+            idx=idx,
+            seq_len=seq_len,
+            horizon=horizon,
+            bs=bs,
+            logger=logger,
+            pad_last_sample=pad_last_sample,
+        )
+        self.report_targets = report_targets
+
+
+    def shuffle(self):
+        perm = np.random.permutation(self.size)
+        self.idx = self.idx[perm]
+        if self.report_targets is not None:
+            self.report_targets = self.report_targets[perm]
+
+
+    def get_iterator(self):
+        self.current_ind = 0
+
+        def _wrapper():
+            while self.current_ind < self.num_batch:
+                start_ind = self.bs * self.current_ind
+                end_ind = min(self.size, self.bs * (self.current_ind + 1))
+                idx_ind = self.idx[start_ind: end_ind, ...]
+
+                x_shape = (len(idx_ind), self.seq_len, self.data.shape[1], self.data.shape[-1])
+                x_shared = mp.RawArray('f', int(np.prod(x_shape)))
+                x = np.frombuffer(x_shared, dtype='f').reshape(x_shape)
+
+                y_shape = (len(idx_ind), self.horizon, self.data.shape[1], 1)
+                y_shared = mp.RawArray('f', int(np.prod(y_shape)))
+                y = np.frombuffer(y_shared, dtype='f').reshape(y_shape)
+
+                array_size = len(idx_ind)
+                num_threads = max(1, len(idx_ind) // 2)
+                chunk_size = max(1, array_size // num_threads)
+                threads = []
+                for i in range(num_threads):
+                    start_index = i * chunk_size
+                    end_index = start_index + chunk_size if i < num_threads - 1 else array_size
+                    thread = threading.Thread(target=self.write_to_shared_array, args=(x, y, idx_ind, start_index, end_index))
+                    thread.start()
+                    threads.append(thread)
+
+                for thread in threads:
+                    thread.join()
+
+                report_batch = None
+                if self.report_targets is not None:
+                    report_batch = self.report_targets[start_ind:end_ind]
+                yield (x, y, report_batch)
                 self.current_ind += 1
 
         return _wrapper()
@@ -98,6 +164,38 @@ def load_dataset(data_path, args, logger):
         idx = np.load(os.path.join(data_path, args.years, 'idx_' + cat + '.npy'))
         dataloader[cat + '_loader'] = DataLoader(ptr['data'][..., :args.input_dim], idx, \
                                                  args.seq_len, args.horizon, args.bs, logger)
+
+    scaler = StandardScaler(mean=ptr['mean'], std=ptr['std'])
+    return dataloader, scaler
+
+
+def load_dataset_with_reports(data_path, args, logger, report_prefix='report'):
+    ptr = np.load(os.path.join(data_path, args.years, 'his.npz'))
+    logger.info('Data shape: ' + str(ptr['data'].shape))
+
+    dataloader = {}
+    for cat in ['train', 'val', 'test']:
+        idx = np.load(os.path.join(data_path, args.years, 'idx_' + cat + '.npy'))
+        report_path = os.path.join(data_path, args.years, '{}_{}.npy'.format(report_prefix, cat))
+        report_targets = None
+        if os.path.exists(report_path):
+            report_targets = np.load(report_path)
+            logger.info('Report target shape for {}: {}'.format(cat, report_targets.shape))
+            if len(report_targets) != len(idx):
+                raise ValueError(
+                    'Report target sample count mismatch for {}: {} vs {}'.format(
+                        cat, len(report_targets), len(idx)
+                    )
+                )
+        dataloader[cat + '_loader'] = DataLoaderWithReport(
+            ptr['data'][..., :args.input_dim],
+            idx,
+            args.seq_len,
+            args.horizon,
+            args.bs,
+            logger,
+            report_targets=report_targets,
+        )
 
     scaler = StandardScaler(mean=ptr['mean'], std=ptr['std'])
     return dataloader, scaler
