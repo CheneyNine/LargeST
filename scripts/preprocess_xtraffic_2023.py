@@ -16,7 +16,7 @@ def parse_counties(counties_arg):
 
 
 def read_and_clean_meta(meta_path):
-    meta = pd.read_csv(meta_path, sep="\t", engine="python", on_bad_lines="skip", low_memory=False)
+    meta = pd.read_csv(meta_path, sep="\t", engine="python", on_bad_lines="skip")
 
     for col in ["City", "Sensor Type"]:
         if col in meta.columns:
