@@ -29,12 +29,12 @@ def read_and_clean_meta(meta_path):
         if col in meta.columns:
             meta[col] = pd.to_numeric(meta[col], errors="coerce")
 
-    required_cols = ["station_id", "Lat", "Lng"]
+    required_cols = ["station_id", "Lat", "Lng", "Barrier"]
     missing_cols = [col for col in required_cols if col not in meta.columns]
     if missing_cols:
         raise ValueError("Meta file missing required columns: {}".format(missing_cols))
 
-    meta = meta.dropna(subset=["station_id", "Lat", "Lng"]).copy()
+    meta = meta.dropna(subset=["station_id", "Lat", "Lng", "Barrier"]).copy()
     meta["station_id"] = meta["station_id"].astype(np.int64)
     return meta
 
