@@ -9,11 +9,12 @@ import torch
 
 torch.set_num_threads(3)
 
-from src.base.engine import BaseEngine
+from src.engines.timecma_engine import TimeCMA_Engine
 from src.models.timecma import TimeCMA
 from src.utils.args import get_public_config
 from src.utils.dataloader import get_dataset_info
 from src.utils.dataloader import load_dataset
+from src.utils.dataloader import load_dataset_with_embeddings
 from src.utils.logging import get_logger
 from src.utils.metrics import masked_mae
 
@@ -37,6 +38,15 @@ def get_config():
     parser.add_argument("--d_ff", type=int, default=256)
     parser.add_argument("--head", type=int, default=8)
     parser.add_argument("--prompt_pool", type=str, default="mean", choices=["mean", "last", "max"])
+    parser.add_argument("--external_prompt_dim", type=int, default=768)
+    parser.add_argument("--prompt_gen_model_name", type=str, default="gpt2")
+    parser.add_argument("--prompt_gen_local_files_only", type=int, default=1)
+    parser.add_argument("--prompt_gen_allow_download", type=int, default=1)
+    parser.add_argument("--prompt_max_tokens", type=int, default=512)
+    parser.add_argument("--use_external_embeddings", type=int, default=0)
+    parser.add_argument("--embedding_prefix", type=str, default="prompt_emb")
+    parser.add_argument("--generate_embeddings_on_the_fly", type=int, default=0)
+    parser.add_argument("--embedding_method", type=str, default="gpt2", choices=["gpt2", "stats"])
 
     parser.add_argument("--lrate", type=float, default=1e-3)
     parser.add_argument("--wdecay", type=float, default=1e-4)
@@ -65,7 +75,12 @@ def main():
     device = torch.device(args.device)
 
     data_path, _, node_num = get_dataset_info(args.dataset)
-    dataloader, scaler = load_dataset(data_path, args, logger)
+    if bool(args.use_external_embeddings):
+        dataloader, scaler = load_dataset_with_embeddings(
+            data_path, args, logger, embedding_prefix=args.embedding_prefix
+        )
+    else:
+        dataloader, scaler = load_dataset(data_path, args, logger)
 
     model = TimeCMA(
         node_num=node_num,
@@ -83,13 +98,18 @@ def main():
         head=args.head,
         dropout=args.dropout,
         prompt_pool=args.prompt_pool,
+        external_prompt_dim=args.external_prompt_dim,
+        prompt_gen_model_name=args.prompt_gen_model_name,
+        prompt_gen_local_files_only=args.prompt_gen_local_files_only,
+        prompt_gen_allow_download=args.prompt_gen_allow_download,
+        prompt_max_tokens=args.prompt_max_tokens,
     )
 
     loss_fn = masked_mae
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lrate, weight_decay=args.wdecay)
     scheduler = None
 
-    engine = BaseEngine(
+    engine = TimeCMA_Engine(
         device=device,
         model=model,
         dataloader=dataloader,
@@ -105,6 +125,8 @@ def main():
         log_dir=log_dir,
         logger=logger,
         seed=args.seed,
+        generate_embeddings_on_the_fly=args.generate_embeddings_on_the_fly,
+        embedding_method=args.embedding_method,
     )
 
     if args.mode == "train":

@@ -141,6 +141,83 @@ class DataLoaderWithReport(DataLoader):
         return _wrapper()
 
 
+class DataLoaderWithEmbedding(DataLoader):
+    def __init__(
+        self,
+        data,
+        idx,
+        seq_len,
+        horizon,
+        bs,
+        logger,
+        embeddings=None,
+        pad_last_sample=False,
+    ):
+        if embeddings is not None and pad_last_sample:
+            num_padding = (bs - (len(idx) % bs)) % bs
+            if num_padding > 0:
+                emb_padding = np.repeat(embeddings[-1:], num_padding, axis=0)
+                embeddings = np.concatenate([embeddings, emb_padding], axis=0)
+        super(DataLoaderWithEmbedding, self).__init__(
+            data=data,
+            idx=idx,
+            seq_len=seq_len,
+            horizon=horizon,
+            bs=bs,
+            logger=logger,
+            pad_last_sample=pad_last_sample,
+        )
+        self.embeddings = embeddings
+
+    def shuffle(self):
+        perm = np.random.permutation(self.size)
+        self.idx = self.idx[perm]
+        if self.embeddings is not None:
+            self.embeddings = self.embeddings[perm]
+
+    def get_iterator(self):
+        self.current_ind = 0
+
+        def _wrapper():
+            while self.current_ind < self.num_batch:
+                start_ind = self.bs * self.current_ind
+                end_ind = min(self.size, self.bs * (self.current_ind + 1))
+                idx_ind = self.idx[start_ind: end_ind, ...]
+
+                x_shape = (len(idx_ind), self.seq_len, self.data.shape[1], self.data.shape[-1])
+                x_shared = mp.RawArray('f', int(np.prod(x_shape)))
+                x = np.frombuffer(x_shared, dtype='f').reshape(x_shape)
+
+                y_shape = (len(idx_ind), self.horizon, self.data.shape[1], 1)
+                y_shared = mp.RawArray('f', int(np.prod(y_shape)))
+                y = np.frombuffer(y_shared, dtype='f').reshape(y_shape)
+
+                array_size = len(idx_ind)
+                num_threads = max(1, len(idx_ind) // 2)
+                chunk_size = max(1, array_size // num_threads)
+                threads = []
+                for i in range(num_threads):
+                    start_index = i * chunk_size
+                    end_index = start_index + chunk_size if i < num_threads - 1 else array_size
+                    thread = threading.Thread(
+                        target=self.write_to_shared_array,
+                        args=(x, y, idx_ind, start_index, end_index),
+                    )
+                    thread.start()
+                    threads.append(thread)
+
+                for thread in threads:
+                    thread.join()
+
+                embedding_batch = None
+                if self.embeddings is not None:
+                    embedding_batch = self.embeddings[start_ind:end_ind]
+                yield (x, y, embedding_batch)
+                self.current_ind += 1
+
+        return _wrapper()
+
+
 class DataLoaderSTLLM(DataLoader):
     def __init__(
         self,
@@ -262,6 +339,49 @@ def load_dataset(data_path, args, logger):
         idx = np.load(os.path.join(data_path, args.years, 'idx_' + cat + '.npy'))
         dataloader[cat + '_loader'] = DataLoader(ptr['data'][..., :args.input_dim], idx, \
                                                  args.seq_len, args.horizon, args.bs, logger)
+
+    scaler = StandardScaler(mean=ptr['mean'], std=ptr['std'])
+    return dataloader, scaler
+
+
+def load_dataset_with_embeddings(data_path, args, logger, embedding_prefix='prompt_emb'):
+    ptr = np.load(os.path.join(data_path, args.years, 'his.npz'))
+    logger.info('Data shape: ' + str(ptr['data'].shape))
+
+    dataloader = {}
+    for cat in ['train', 'val', 'test']:
+        idx = np.load(os.path.join(data_path, args.years, 'idx_' + cat + '.npy'))
+        embedding_path = os.path.join(
+            data_path, args.years, '{}_{}.npy'.format(embedding_prefix, cat)
+        )
+        embeddings = None
+        if os.path.exists(embedding_path):
+            embeddings = np.load(embedding_path)
+            logger.info(
+                'Prompt embedding shape for {}: {}'.format(cat, embeddings.shape)
+            )
+            if len(embeddings) != len(idx):
+                raise ValueError(
+                    'Prompt embedding sample count mismatch for {}: {} vs {}'.format(
+                        cat, len(embeddings), len(idx)
+                    )
+                )
+        else:
+            logger.info(
+                'Prompt embedding file not found for {}: {}, fallback to in-model prompt branch'.format(
+                    cat, embedding_path
+                )
+            )
+
+        dataloader[cat + '_loader'] = DataLoaderWithEmbedding(
+            ptr['data'][..., :args.input_dim],
+            idx,
+            args.seq_len,
+            args.horizon,
+            args.bs,
+            logger,
+            embeddings=embeddings,
+        )
 
     scaler = StandardScaler(mean=ptr['mean'], std=ptr['std'])
     return dataloader, scaler

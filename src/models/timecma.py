@@ -4,6 +4,13 @@ import torch.nn.functional as F
 
 from src.base.model import BaseModel
 
+try:
+    from transformers import GPT2Model
+    from transformers import GPT2Tokenizer
+except Exception:
+    GPT2Model = None
+    GPT2Tokenizer = None
+
 
 class TimeCMA(BaseModel):
     """
@@ -27,6 +34,11 @@ class TimeCMA(BaseModel):
         head,
         dropout,
         prompt_pool,
+        external_prompt_dim,
+        prompt_gen_model_name,
+        prompt_gen_local_files_only,
+        prompt_gen_allow_download,
+        prompt_max_tokens,
         **args
     ):
         super(TimeCMA, self).__init__(**args)
@@ -39,14 +51,19 @@ class TimeCMA(BaseModel):
             )
         if channel % head != 0:
             raise ValueError("channel must be divisible by head")
-        if prompt_dim > 0 and prompt_hidden % head != 0:
-            raise ValueError("prompt_hidden must be divisible by head when prompt_dim > 0")
+        if prompt_hidden % head != 0:
+            raise ValueError("prompt_hidden must be divisible by head")
 
         self.ts_dim = ts_dim
         self.prompt_dim = prompt_dim
         self.channel = channel
         self.prompt_hidden = prompt_hidden
         self.prompt_pool = prompt_pool
+        self.external_prompt_dim = external_prompt_dim
+        self.prompt_gen_model_name = prompt_gen_model_name
+        self.prompt_gen_local_files_only = bool(prompt_gen_local_files_only)
+        self.prompt_gen_allow_download = bool(prompt_gen_allow_download)
+        self.prompt_max_tokens = prompt_max_tokens
 
         self.normalize_layer = Normalize(self.node_num, affine=False)
         self.history_proj = nn.Linear(self.seq_len * ts_dim, channel)
@@ -67,22 +84,30 @@ class TimeCMA(BaseModel):
         )
 
         self.prompt_missing = nn.Parameter(torch.zeros(1, self.node_num, channel))
+        self.prompt_encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=prompt_hidden,
+                nhead=head,
+                dim_feedforward=max(d_ff, prompt_hidden * 2),
+                **encoder_args
+            ),
+            num_layers=e_layer,
+        )
+        self.prompt_to_channel = nn.Linear(prompt_hidden, channel)
         if prompt_dim > 0:
             self.prompt_proj = nn.Linear(prompt_dim, prompt_hidden)
-            self.prompt_encoder = nn.TransformerEncoder(
-                nn.TransformerEncoderLayer(
-                    d_model=prompt_hidden,
-                    nhead=head,
-                    dim_feedforward=max(d_ff, prompt_hidden * 2),
-                    **encoder_args
-                ),
-                num_layers=e_layer,
-            )
-            self.prompt_to_channel = nn.Linear(prompt_hidden, channel)
         else:
             self.prompt_proj = None
-            self.prompt_encoder = None
-            self.prompt_to_channel = nn.Identity()
+
+        self.external_prompt_proj = nn.Linear(self.external_prompt_dim, prompt_hidden)
+        self.prompt_stat_projector = nn.Sequential(
+            nn.Linear(max(4, ts_dim * 2), prompt_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(prompt_hidden, self.external_prompt_dim),
+        )
+        self._prompt_generator_model = None
+        self._prompt_generator_tokenizer = None
 
         self.cross = CrossModal(
             d_model=channel,
@@ -117,6 +142,147 @@ class TimeCMA(BaseModel):
             nn.Linear(channel, self.horizon * self.output_dim),
         )
 
+    def _ensure_prompt_generator(self, device):
+        if self._prompt_generator_model is not None and self._prompt_generator_tokenizer is not None:
+            self._prompt_generator_model = self._prompt_generator_model.to(device)
+            return
+        if GPT2Model is None or GPT2Tokenizer is None:
+            raise ImportError(
+                "transformers is required for GPT2 prompt embedding generation. "
+                "Install transformers or use method='stats'."
+            )
+
+        try:
+            tokenizer = GPT2Tokenizer.from_pretrained(
+                self.prompt_gen_model_name,
+                local_files_only=self.prompt_gen_local_files_only,
+            )
+            model = GPT2Model.from_pretrained(
+                self.prompt_gen_model_name,
+                local_files_only=self.prompt_gen_local_files_only,
+            )
+        except Exception:
+            if not self.prompt_gen_allow_download:
+                raise
+            tokenizer = GPT2Tokenizer.from_pretrained(
+                self.prompt_gen_model_name,
+                local_files_only=False,
+            )
+            model = GPT2Model.from_pretrained(
+                self.prompt_gen_model_name,
+                local_files_only=False,
+            )
+
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        model = model.to(device)
+        model.eval()
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+
+        self._prompt_generator_model = model
+        self._prompt_generator_tokenizer = tokenizer
+
+    def generate_prompt_embeddings(self, ts_inputs, input_mark=None, method="stats"):
+        """
+        Generate prompt embeddings for external-embedding TimeCMA mode.
+
+        Args:
+            ts_inputs: [B, T, N, ts_dim] or [B, T, N]
+            input_mark: optional timestamp features.
+            method: "gpt2" (text prompt last-token embedding) or "stats" (lightweight projector).
+
+        Returns:
+            Tensor shaped [B, external_prompt_dim, N, 1]
+        """
+        if ts_inputs.dim() == 3:
+            ts_inputs = ts_inputs.unsqueeze(-1)
+        if ts_inputs.dim() != 4:
+            raise ValueError("ts_inputs must be 4D [B, T, N, C], got {}".format(ts_inputs.shape))
+
+        batch_size, seq_len, node_num, feat_dim = ts_inputs.shape
+        if feat_dim < 1:
+            raise ValueError("ts_inputs must include at least one feature channel")
+
+        base_series = ts_inputs[..., 0]
+        min_v = base_series.min(dim=1).values
+        max_v = base_series.max(dim=1).values
+        mean_v = base_series.mean(dim=1)
+        trend_v = (base_series[:, -1, :] - base_series[:, 0, :])
+
+        if method == "stats":
+            # [B, N, 4]
+            stats = torch.stack([min_v, max_v, mean_v, trend_v], dim=-1)
+            stats = stats.reshape(batch_size * node_num, -1)
+
+            if stats.shape[-1] < max(4, self.ts_dim * 2):
+                pad_dim = max(4, self.ts_dim * 2) - stats.shape[-1]
+                pad = torch.zeros(stats.shape[0], pad_dim, device=stats.device, dtype=stats.dtype)
+                stats = torch.cat([stats, pad], dim=-1)
+            elif stats.shape[-1] > max(4, self.ts_dim * 2):
+                stats = stats[:, : max(4, self.ts_dim * 2)]
+
+            emb = self.prompt_stat_projector(stats)
+            emb = emb.view(batch_size, node_num, self.external_prompt_dim)
+            emb = emb.permute(0, 2, 1).unsqueeze(-1).contiguous()
+            return emb
+
+        if method != "gpt2":
+            raise ValueError("Unsupported embedding generation method: {}".format(method))
+
+        self._ensure_prompt_generator(ts_inputs.device)
+        tokenizer = self._prompt_generator_tokenizer
+        model = self._prompt_generator_model
+
+        prompts = []
+        for b in range(batch_size):
+            for n in range(node_num):
+                values = ts_inputs[b, :, n, 0].detach().cpu().tolist()
+                values_str = ", ".join(["{:.4f}".format(v) for v in values])
+                trend = trend_v[b, n].item()
+
+                if input_mark is not None and input_mark.dim() >= 3 and input_mark.shape[1] == seq_len:
+                    start_mark = input_mark[b, 0].detach().cpu().tolist()
+                    end_mark = input_mark[b, -1].detach().cpu().tolist()
+                    prompt = (
+                        "From {} to {}, values were [{}]. trend={:.4f}".format(
+                            start_mark, end_mark, values_str, trend
+                        )
+                    )
+                else:
+                    prompt = (
+                        "Given {} steps values [{}], trend is {:.4f}.".format(
+                            seq_len, values_str, trend
+                        )
+                    )
+                prompts.append(prompt)
+
+        with torch.no_grad():
+            tokenized = tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.prompt_max_tokens,
+            )
+            tokenized = {k: v.to(ts_inputs.device) for k, v in tokenized.items()}
+            outputs = model(**tokenized).last_hidden_state  # [B*N, L, E]
+            attention_mask = tokenized["attention_mask"]
+            last_pos = attention_mask.sum(dim=1) - 1
+            gather_index = last_pos.view(-1, 1, 1).expand(-1, 1, outputs.shape[-1])
+            last_token = outputs.gather(dim=1, index=gather_index).squeeze(1)  # [B*N, E]
+
+        emb = last_token.view(batch_size, node_num, -1)
+        if emb.shape[-1] != self.external_prompt_dim:
+            if emb.shape[-1] > self.external_prompt_dim:
+                emb = emb[..., : self.external_prompt_dim]
+            else:
+                pad = emb.new_zeros(batch_size, node_num, self.external_prompt_dim - emb.shape[-1])
+                emb = torch.cat([emb, pad], dim=-1)
+        emb = emb.permute(0, 2, 1).unsqueeze(-1).contiguous()
+        return emb
+
     def _pool_prompt(self, prompt_inputs):
         if self.prompt_dim == 0:
             return self.prompt_missing.expand(prompt_inputs.shape[0], -1, -1)
@@ -132,7 +298,35 @@ class TimeCMA(BaseModel):
         prompt = self.prompt_encoder(prompt)
         return self.prompt_to_channel(prompt)
 
-    def forward(self, inputs, label=None):
+    def _encode_external_embeddings(self, embeddings):
+        if embeddings.dim() == 4 and embeddings.shape[-1] == 1:
+            embeddings = embeddings.squeeze(-1)  # [B, E, N] or [B, N, E]
+        if embeddings.dim() != 3:
+            raise ValueError("External embeddings must be 3D/4D, got {}".format(embeddings.shape))
+
+        if embeddings.shape[1] == self.node_num:
+            emb_bnE = embeddings  # [B, N, E]
+        elif embeddings.shape[2] == self.node_num:
+            emb_bnE = embeddings.permute(0, 2, 1).contiguous()  # [B, N, E]
+        else:
+            raise ValueError(
+                "External embeddings shape {} does not match node_num {}".format(
+                    tuple(embeddings.shape), self.node_num
+                )
+            )
+
+        if emb_bnE.shape[-1] != self.external_prompt_dim:
+            raise ValueError(
+                "External embedding dim mismatch: expected {}, got {}".format(
+                    self.external_prompt_dim, emb_bnE.shape[-1]
+                )
+            )
+
+        prompt = self.external_prompt_proj(emb_bnE)
+        prompt = self.prompt_encoder(prompt)
+        return self.prompt_to_channel(prompt)
+
+    def forward(self, inputs, label=None, embeddings=None):
         ts_inputs = inputs[..., : self.ts_dim]
         prompt_inputs = inputs[..., self.ts_dim :]
 
@@ -149,7 +343,10 @@ class TimeCMA(BaseModel):
         ts_tokens = self.history_proj(ts_tokens)
         ts_tokens = self.ts_encoder(ts_tokens)
 
-        prompt_tokens = self._pool_prompt(prompt_inputs)
+        if embeddings is not None:
+            prompt_tokens = self._encode_external_embeddings(embeddings)
+        else:
+            prompt_tokens = self._pool_prompt(prompt_inputs)
         cross_tokens = self.cross(ts_tokens, prompt_tokens, prompt_tokens)
         decoded = self.decoder(cross_tokens, cross_tokens)
 

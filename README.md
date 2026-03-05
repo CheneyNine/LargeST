@@ -92,7 +92,29 @@ For example, with 3 traffic channels and 64 prompt channels:
 ```
 python experiments/timecma/main.py --device cuda:0 --dataset SD --years 2019 --model_name timecma --seed 2023 --bs 16 --input_dim 67 --ts_dim 3 --prompt_dim 64 --prompt_hidden 128 --prompt_pool mean
 ```
-This repository version keeps the TimeCMA dual-branch encoding and cross-modal alignment, but adapts the model to LargeST's single-tensor dataloader by pooling prompt channels over time into one embedding per node. Since TimeCMA uses node-wise attention, it is best validated on smaller subsets such as SD first.
+This repository version keeps the TimeCMA dual-branch encoding and cross-modal alignment, and now supports two prompt-embedding modes:
+- inline prompt channels appended to `his.npz` (as above), or
+- external embeddings (official-style) passed to `forward` via dataloader.
+
+To generate external prompt embeddings in the repository:
+```
+python scripts/generate_timecma_prompt_embeddings.py --data_path data/sd --years 2019 --ts_dim 3 --seq_len 12 --embedding_method gpt2 --device cuda:0
+```
+This script saves:
+```
+data/sd/2019/prompt_emb_train.npy
+data/sd/2019/prompt_emb_val.npy
+data/sd/2019/prompt_emb_test.npy
+```
+Then train TimeCMA with:
+```
+python experiments/timecma/main.py --device cuda:0 --dataset SD --years 2019 --model_name timecma --seed 2023 --bs 16 --input_dim 3 --ts_dim 3 --prompt_dim 0 --use_external_embeddings 1 --embedding_prefix prompt_emb --external_prompt_dim 768
+```
+You can also skip pre-saving and generate embeddings online during training:
+```
+python experiments/timecma/main.py --device cuda:0 --dataset SD --years 2019 --model_name timecma --seed 2023 --bs 8 --input_dim 3 --ts_dim 3 --prompt_dim 0 --generate_embeddings_on_the_fly 1 --embedding_method gpt2 --external_prompt_dim 768
+```
+Since TimeCMA uses node-wise attention and prompt generation can be expensive, it is best validated on smaller subsets such as SD first.
 
 To run the Time-LLM adaptation, you may execute:
 ```
