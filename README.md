@@ -106,11 +106,13 @@ This repository version keeps Time-LLM's patch reprogramming and prompt-token co
 
 To run the ST-LLM adaptation (only ST_LLM model from [ST-LLM](https://github.com/ChenxiLiu-HNU/ST-LLM)), you may execute:
 ```
-python experiments/stllm/main.py --device cuda:0 --dataset SD --years 2019 --model_name stllm --seed 2023 --bs 16 --seq_len 12 --horizon 12 --input_dim 3 --output_dim 1 --steps_per_day 288
+python experiments/stllm/main.py --device cuda:0 --dataset SD --years 2019 --model_name stllm --seed 2023 --bs 16 --seq_len 12 --horizon 12 --input_dim 3 --output_dim 1 --steps_per_day 288 --auto_time_features 1
 ```
-If your dataset is flow-only without explicit time-of-day/day-of-week channels, set:
+This version supports automatic temporal feature generation in the dataloader: for each training window index, it dynamically appends `time_of_day` and `day_of_week` channels.
+
+If your dataset is flow-only (e.g., only one traffic channel), keep:
 ```
---time_day_idx -1 --day_in_week_idx -1
+--input_dim 1 --auto_time_features 1
 ```
 This repository version keeps ST-LLM's spatial-temporal embedding design and partially frozen attention strategy over GPT-2, while adapting input/output to the native LargeST dataloader and training pipeline.
 

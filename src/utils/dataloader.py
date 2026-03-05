@@ -141,6 +141,104 @@ class DataLoaderWithReport(DataLoader):
         return _wrapper()
 
 
+class DataLoaderSTLLM(DataLoader):
+    def __init__(
+        self,
+        data,
+        idx,
+        seq_len,
+        horizon,
+        bs,
+        logger,
+        steps_per_day=288,
+        add_time_of_day=True,
+        add_day_of_week=True,
+        time_start_offset=0,
+        pad_last_sample=False,
+    ):
+        super(DataLoaderSTLLM, self).__init__(
+            data=data,
+            idx=idx,
+            seq_len=seq_len,
+            horizon=horizon,
+            bs=bs,
+            logger=logger,
+            pad_last_sample=pad_last_sample,
+        )
+        self.base_feature_dim = data.shape[-1]
+        self.steps_per_day = max(1, int(steps_per_day))
+        self.add_time_of_day = bool(add_time_of_day)
+        self.add_day_of_week = bool(add_day_of_week)
+        self.time_start_offset = int(time_start_offset)
+        self.temporal_feature_dim = int(self.add_time_of_day) + int(self.add_day_of_week)
+        self.total_feature_dim = self.base_feature_dim + self.temporal_feature_dim
+
+        logger.info(
+            "STLLM temporal features enabled: tod={}, dow={}, total_input_dim={}".format(
+                self.add_time_of_day, self.add_day_of_week, self.total_feature_dim
+            )
+        )
+
+    def write_to_shared_array(self, x, y, idx_ind, start_idx, end_idx):
+        for i in range(start_idx, end_idx):
+            history_index = idx_ind[i] + self.x_offsets
+            x[i, :, :, : self.base_feature_dim] = self.data[history_index, :, :]
+
+            if self.temporal_feature_dim > 0:
+                global_step = history_index + self.time_start_offset
+                feature_cursor = self.base_feature_dim
+
+                if self.add_time_of_day:
+                    tod = (np.mod(global_step, self.steps_per_day).astype(np.float32) / self.steps_per_day)
+                    x[i, :, :, feature_cursor] = tod[:, None]
+                    feature_cursor += 1
+
+                if self.add_day_of_week:
+                    dow = np.mod(np.floor_divide(global_step, self.steps_per_day), 7).astype(np.float32)
+                    x[i, :, :, feature_cursor] = dow[:, None]
+
+            y[i] = self.data[idx_ind[i] + self.y_offsets, :, :1]
+
+    def get_iterator(self):
+        self.current_ind = 0
+
+        def _wrapper():
+            while self.current_ind < self.num_batch:
+                start_ind = self.bs * self.current_ind
+                end_ind = min(self.size, self.bs * (self.current_ind + 1))
+                idx_ind = self.idx[start_ind: end_ind, ...]
+
+                x_shape = (len(idx_ind), self.seq_len, self.data.shape[1], self.total_feature_dim)
+                x_shared = mp.RawArray('f', int(np.prod(x_shape)))
+                x = np.frombuffer(x_shared, dtype='f').reshape(x_shape)
+
+                y_shape = (len(idx_ind), self.horizon, self.data.shape[1], 1)
+                y_shared = mp.RawArray('f', int(np.prod(y_shape)))
+                y = np.frombuffer(y_shared, dtype='f').reshape(y_shape)
+
+                array_size = len(idx_ind)
+                num_threads = max(1, len(idx_ind) // 2)
+                chunk_size = max(1, array_size // num_threads)
+                threads = []
+                for i in range(num_threads):
+                    start_index = i * chunk_size
+                    end_index = start_index + chunk_size if i < num_threads - 1 else array_size
+                    thread = threading.Thread(
+                        target=self.write_to_shared_array,
+                        args=(x, y, idx_ind, start_index, end_index),
+                    )
+                    thread.start()
+                    threads.append(thread)
+
+                for thread in threads:
+                    thread.join()
+
+                yield (x, y)
+                self.current_ind += 1
+
+        return _wrapper()
+
+
 class StandardScaler():
     def __init__(self, mean, std):
         self.mean = torch.tensor(mean)
@@ -195,6 +293,40 @@ def load_dataset_with_reports(data_path, args, logger, report_prefix='report'):
             args.bs,
             logger,
             report_targets=report_targets,
+        )
+
+    scaler = StandardScaler(mean=ptr['mean'], std=ptr['std'])
+    return dataloader, scaler
+
+
+def load_dataset_for_stllm(
+    data_path,
+    args,
+    logger,
+    base_input_dim,
+    steps_per_day=288,
+    add_time_of_day=True,
+    add_day_of_week=True,
+    time_start_offset=0,
+):
+    ptr = np.load(os.path.join(data_path, args.years, 'his.npz'))
+    logger.info('Data shape: ' + str(ptr['data'].shape))
+
+    base_data = ptr['data'][..., :base_input_dim]
+    dataloader = {}
+    for cat in ['train', 'val', 'test']:
+        idx = np.load(os.path.join(data_path, args.years, 'idx_' + cat + '.npy'))
+        dataloader[cat + '_loader'] = DataLoaderSTLLM(
+            base_data,
+            idx,
+            args.seq_len,
+            args.horizon,
+            args.bs,
+            logger,
+            steps_per_day=steps_per_day,
+            add_time_of_day=add_time_of_day,
+            add_day_of_week=add_day_of_week,
+            time_start_offset=time_start_offset,
         )
 
     scaler = StandardScaler(mean=ptr['mean'], std=ptr['std'])

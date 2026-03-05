@@ -14,6 +14,7 @@ from src.models.stllm import ST_LLM
 from src.utils.args import get_public_config
 from src.utils.dataloader import get_dataset_info
 from src.utils.dataloader import load_dataset
+from src.utils.dataloader import load_dataset_for_stllm
 from src.utils.logging import get_logger
 from src.utils.metrics import masked_mae
 
@@ -35,6 +36,10 @@ def get_config():
     parser.add_argument("--llm_layer", type=int, default=6)
     parser.add_argument("--U", type=int, default=1)
     parser.add_argument("--steps_per_day", type=int, default=288)
+    parser.add_argument("--auto_time_features", type=int, default=1)
+    parser.add_argument("--add_time_of_day", type=int, default=1)
+    parser.add_argument("--add_day_of_week", type=int, default=1)
+    parser.add_argument("--time_start_offset", type=int, default=0)
     parser.add_argument("--time_day_idx", type=int, default=1)
     parser.add_argument("--day_in_week_idx", type=int, default=2)
     parser.add_argument("--gpt_model_name", type=str, default="gpt2")
@@ -77,11 +82,40 @@ def main():
     device = torch.device(args.device)
 
     data_path, node_num = resolve_data_info(args, logger)
-    dataloader, scaler = load_dataset(data_path, args, logger)
+    if bool(args.auto_time_features):
+        base_input_dim = args.input_dim
+        add_time_of_day = bool(args.add_time_of_day)
+        add_day_of_week = bool(args.add_day_of_week)
+        extra_dim = int(add_time_of_day) + int(add_day_of_week)
+        model_input_dim = base_input_dim + extra_dim
+
+        dataloader, scaler = load_dataset_for_stllm(
+            data_path=data_path,
+            args=args,
+            logger=logger,
+            base_input_dim=base_input_dim,
+            steps_per_day=args.steps_per_day,
+            add_time_of_day=add_time_of_day,
+            add_day_of_week=add_day_of_week,
+            time_start_offset=args.time_start_offset,
+        )
+
+        time_day_idx = base_input_dim if add_time_of_day else -1
+        day_in_week_idx = base_input_dim + int(add_time_of_day) if add_day_of_week else -1
+        logger.info(
+            "Auto temporal features: model_input_dim={}, time_day_idx={}, day_in_week_idx={}".format(
+                model_input_dim, time_day_idx, day_in_week_idx
+            )
+        )
+    else:
+        model_input_dim = args.input_dim
+        dataloader, scaler = load_dataset(data_path, args, logger)
+        time_day_idx = args.time_day_idx
+        day_in_week_idx = args.day_in_week_idx
 
     model = ST_LLM(
         node_num=node_num,
-        input_dim=args.input_dim,
+        input_dim=model_input_dim,
         output_dim=args.output_dim,
         seq_len=args.seq_len,
         horizon=args.horizon,
@@ -89,8 +123,8 @@ def main():
         llm_layer=args.llm_layer,
         U=args.U,
         steps_per_day=args.steps_per_day,
-        time_day_idx=args.time_day_idx,
-        day_in_week_idx=args.day_in_week_idx,
+        time_day_idx=time_day_idx,
+        day_in_week_idx=day_in_week_idx,
         gpt_model_name=args.gpt_model_name,
         gpt_local_files_only=args.gpt_local_files_only,
         gpt_allow_download=args.gpt_allow_download,
