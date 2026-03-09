@@ -5,21 +5,45 @@ import torch.nn.functional as F
 from src.base.model import BaseModel
 
 try:
-    from transformers import GPT2Model
-    from transformers import GPT2Tokenizer
+    from transformers import GPT2Tokenizer, GPT2Model
 except Exception:
     GPT2Model = None
     GPT2Tokenizer = None
 
 
+OFFICIAL_INPUT_TEMPLATES = {
+    "FRED": "From [t1] to [t2], the values were value1, ..., valuen every month. The total trend value was Trends",
+    "ILI": "From [t1] to [t2], the values were value1, ..., valuen every week. The total trend value was Trends",
+    "ETTh1": "From [t1] to [t2], the values were value1, ..., valuen every hour. The total trend value was Trends",
+    "ETTh2": "From [t1] to [t2], the values were value1, ..., valuen every hour. The total trend value was Trends",
+    "ECL": "From [t1] to [t2], the values were value1, ..., valuen every hour. The total trend value was Trends",
+    "ETTm1": "From [t1] to [t2], the values were value1, ..., valuen every 15 minutes. The total trend value was Trends",
+    "ETTm2": "From [t1] to [t2], the values were value1, ..., valuen every 15 minutes. The total trend value was Trends",
+    "Weather": "From [t1] to [t2], the values were value1, ..., valuen every 10 minutes. The total trend value was Trends",
+}
+
+TRAFFIC_INPUT_TEMPLATES = {
+    "CA": "From [t1] to [t2], the traffic flow values were value1, ..., valuen every 5 minutes. The total trend value was Trends",
+    "GLA": "From [t1] to [t2], the traffic flow values were value1, ..., valuen every 5 minutes. The total trend value was Trends",
+    "GBA": "From [t1] to [t2], the traffic flow values were value1, ..., valuen every 5 minutes. The total trend value was Trends",
+    "SD": "From [t1] to [t2], the traffic flow values were value1, ..., valuen every 5 minutes. The total trend value was Trends",
+    "SACRAMENTO": "From [t1] to [t2], the traffic flow values were value1, ..., valuen every 5 minutes. The total trend value was Trends",
+    "SACRA": "From [t1] to [t2], the traffic flow values were value1, ..., valuen every 5 minutes. The total trend value was Trends",
+    "XTRAFFIC": "From [t1] to [t2], the traffic flow values were value1, ..., valuen every 5 minutes. The total trend value was Trends",
+}
+
+DATE_ONLY_DATASETS = {"FRED", "ILI"}
+HOUR_ONLY_DATASETS = {"ETTh1", "ETTh2", "ECL"}
+
+
 class TimeCMA(BaseModel):
     """
-    LargeST-compatible TimeCMA adaptation.
+    LargeST-compatible TimeCMA using the official Dual-branch layout.
 
-    Input layout:
-    - the first `ts_dim` channels are time-series history features
-    - the next `prompt_dim` channels are aligned prompt embeddings appended to
-      each timestamp-node pair and pooled back to one embedding per node
+    The official TimeCMA backbone assumes one scalar series per node. In
+    LargeST, the first history channel is treated as that forecasting signal,
+    while optional prompt channels or external prompt embeddings feed the
+    prompt branch.
     """
 
     def __init__(
@@ -39,6 +63,9 @@ class TimeCMA(BaseModel):
         prompt_gen_local_files_only,
         prompt_gen_allow_download,
         prompt_max_tokens,
+        prompt_data_name="Traffic",
+        prompt_input_template="",
+        prompt_freq_minutes=5,
         **args
     ):
         super(TimeCMA, self).__init__(**args)
@@ -49,10 +76,12 @@ class TimeCMA(BaseModel):
                     ts_dim, prompt_dim, self.input_dim
                 )
             )
+        if ts_dim < 1:
+            raise ValueError("ts_dim must be >= 1")
         if channel % head != 0:
             raise ValueError("channel must be divisible by head")
-        if prompt_hidden % head != 0:
-            raise ValueError("prompt_hidden must be divisible by head")
+        if external_prompt_dim % head != 0:
+            raise ValueError("external_prompt_dim must be divisible by head")
 
         self.ts_dim = ts_dim
         self.prompt_dim = prompt_dim
@@ -64,9 +93,12 @@ class TimeCMA(BaseModel):
         self.prompt_gen_local_files_only = bool(prompt_gen_local_files_only)
         self.prompt_gen_allow_download = bool(prompt_gen_allow_download)
         self.prompt_max_tokens = prompt_max_tokens
+        self.prompt_data_name = str(prompt_data_name)
+        self.prompt_input_template = str(prompt_input_template) if prompt_input_template is not None else ""
+        self.prompt_freq_minutes = int(prompt_freq_minutes)
 
         self.normalize_layer = Normalize(self.node_num, affine=False)
-        self.history_proj = nn.Linear(self.seq_len * ts_dim, channel)
+        self.length_to_feature = nn.Linear(self.seq_len, self.channel)
 
         encoder_args = dict(
             batch_first=True,
@@ -77,41 +109,39 @@ class TimeCMA(BaseModel):
             nn.TransformerEncoderLayer(
                 d_model=channel,
                 nhead=head,
-                dim_feedforward=d_ff,
                 **encoder_args
             ),
             num_layers=e_layer,
         )
 
-        self.prompt_missing = nn.Parameter(torch.zeros(1, self.node_num, channel))
+        self.prompt_missing = nn.Parameter(
+            torch.zeros(1, self.node_num, self.external_prompt_dim)
+        )
         self.prompt_encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
-                d_model=prompt_hidden,
+                d_model=self.external_prompt_dim,
                 nhead=head,
-                dim_feedforward=max(d_ff, prompt_hidden * 2),
                 **encoder_args
             ),
             num_layers=e_layer,
         )
-        self.prompt_to_channel = nn.Linear(prompt_hidden, channel)
         if prompt_dim > 0:
-            self.prompt_proj = nn.Linear(prompt_dim, prompt_hidden)
+            self.prompt_proj = nn.Linear(prompt_dim, self.external_prompt_dim)
         else:
             self.prompt_proj = None
 
-        self.external_prompt_proj = nn.Linear(self.external_prompt_dim, prompt_hidden)
         self.prompt_stat_projector = nn.Sequential(
-            nn.Linear(max(4, ts_dim * 2), prompt_hidden),
+            nn.Linear(max(4, ts_dim * 2), self.prompt_hidden),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(prompt_hidden, self.external_prompt_dim),
+            nn.Linear(self.prompt_hidden, self.external_prompt_dim),
         )
         self._prompt_generator_model = None
         self._prompt_generator_tokenizer = None
 
         self.cross = CrossModal(
-            d_model=channel,
-            n_heads=head,
+            d_model=self.node_num,
+            n_heads=1,
             d_ff=d_ff,
             norm="LayerNorm",
             attn_dropout=dropout,
@@ -127,7 +157,6 @@ class TimeCMA(BaseModel):
             nn.TransformerDecoderLayer(
                 d_model=channel,
                 nhead=head,
-                dim_feedforward=d_ff,
                 batch_first=True,
                 norm_first=True,
                 dropout=dropout,
@@ -135,12 +164,7 @@ class TimeCMA(BaseModel):
             num_layers=d_layer,
         )
 
-        self.projection = nn.Sequential(
-            nn.Linear(channel, channel),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(channel, self.horizon * self.output_dim),
-        )
+        self.projection = nn.Linear(channel, self.horizon * self.output_dim, bias=True)
 
     def _ensure_prompt_generator(self, device):
         if self._prompt_generator_model is not None and self._prompt_generator_tokenizer is not None:
@@ -184,13 +208,73 @@ class TimeCMA(BaseModel):
         self._prompt_generator_model = model
         self._prompt_generator_tokenizer = tokenizer
 
-    def generate_prompt_embeddings(self, ts_inputs, input_mark=None, method="stats"):
+    def _minutes_to_phrase(self, freq_minutes):
+        if freq_minutes <= 0:
+            return "step"
+        if freq_minutes % (24 * 60) == 0:
+            days = freq_minutes // (24 * 60)
+            return "day" if days == 1 else "{} days".format(days)
+        if freq_minutes % 60 == 0:
+            hours = freq_minutes // 60
+            return "hour" if hours == 1 else "{} hours".format(hours)
+        return "{} minutes".format(freq_minutes)
+
+    def _resolve_input_template(self, data_name=None, input_template=None):
+        if input_template is None:
+            input_template = self.prompt_input_template
+        if input_template is not None and str(input_template).strip():
+            return str(input_template).strip()
+
+        key = str(data_name if data_name is not None else self.prompt_data_name).strip()
+        if key in OFFICIAL_INPUT_TEMPLATES:
+            return OFFICIAL_INPUT_TEMPLATES[key]
+        for name, template in OFFICIAL_INPUT_TEMPLATES.items():
+            if key.lower() == name.lower():
+                return template
+
+        key_upper = key.upper()
+        if key_upper in TRAFFIC_INPUT_TEMPLATES:
+            return TRAFFIC_INPUT_TEMPLATES[key_upper]
+
+        freq_phrase = self._minutes_to_phrase(self.prompt_freq_minutes)
+        return (
+            "From [t1] to [t2], the values were value1, ..., valuen every {}. "
+            "The total trend value was Trends"
+        ).format(freq_phrase)
+
+    def _format_prompt_date(self, mark_row, data_name):
+        values = mark_row.detach().cpu().tolist() if torch.is_tensor(mark_row) else list(mark_row)
+        if len(values) < 3:
+            raise ValueError("input_mark row must include at least year/month/day, got {}".format(values))
+
+        year = int(values[0])
+        month = int(values[1])
+        day = int(values[2])
+        hour = int(values[4]) if len(values) > 4 else 0
+        minute = int(values[5]) if len(values) > 5 else 0
+
+        key = str(data_name if data_name is not None else self.prompt_data_name).strip()
+        key_upper = key.upper()
+        if key in DATE_ONLY_DATASETS or key_upper in DATE_ONLY_DATASETS:
+            return "{:02d}/{:02d}/{:04d}".format(day, month, year)
+        if key in HOUR_ONLY_DATASETS or key_upper in HOUR_ONLY_DATASETS:
+            return "{:02d}/{:02d}/{:04d} {:02d}:00".format(day, month, year, hour)
+        return "{:02d}/{:02d}/{:04d} {:02d}:{:02d}".format(day, month, year, hour, minute)
+
+    def generate_prompt_embeddings(
+        self,
+        ts_inputs,
+        input_mark=None,
+        method="stats",
+        data_name=None,
+        input_template=None,
+    ):
         """
         Generate prompt embeddings for external-embedding TimeCMA mode.
 
         Args:
             ts_inputs: [B, T, N, ts_dim] or [B, T, N]
-            input_mark: optional timestamp features.
+            input_mark: timestamp features [B, T, M], M>=3.
             method: "gpt2" (text prompt last-token embedding) or "stats" (lightweight projector).
 
         Returns:
@@ -231,61 +315,96 @@ class TimeCMA(BaseModel):
         if method != "gpt2":
             raise ValueError("Unsupported embedding generation method: {}".format(method))
 
+        if input_mark is None:
+            raise ValueError(
+                "input_mark is required for method='gpt2'. "
+                "Provide [year,month,day,weekday,hour,minute] marks per step."
+            )
+        if not torch.is_tensor(input_mark):
+            input_mark = torch.as_tensor(input_mark, device=ts_inputs.device)
+        else:
+            input_mark = input_mark.to(ts_inputs.device)
+        if input_mark.dim() != 3:
+            raise ValueError("input_mark must be 3D [B, T, M], got {}".format(tuple(input_mark.shape)))
+        if input_mark.shape[0] != batch_size or input_mark.shape[1] != seq_len:
+            raise ValueError(
+                "input_mark shape mismatch: expected [{}, {}, M], got {}".format(
+                    batch_size, seq_len, tuple(input_mark.shape)
+                )
+            )
+
         self._ensure_prompt_generator(ts_inputs.device)
         tokenizer = self._prompt_generator_tokenizer
         model = self._prompt_generator_model
+        resolved_data_name = data_name if data_name is not None else self.prompt_data_name
+        resolved_template = self._resolve_input_template(
+            data_name=resolved_data_name, input_template=input_template
+        )
 
-        prompts = []
+        tokenized_prompts = []
+        max_token_count = 0
         for b in range(batch_size):
             for n in range(node_num):
-                values = ts_inputs[b, :, n, 0].detach().cpu().tolist()
-                values_str = ", ".join(["{:.4f}".format(v) for v in values])
-                trend = trend_v[b, n].item()
+                values = ts_inputs[b, :, n, 0].detach().reshape(-1)
+                values_str = ", ".join([str(int(v.item())) for v in values])
+                trends = torch.sum(torch.diff(values))
+                trends_str = "{:0f}".format(float(trends.item()))
 
-                if input_mark is not None and input_mark.dim() >= 3 and input_mark.shape[1] == seq_len:
-                    start_mark = input_mark[b, 0].detach().cpu().tolist()
-                    end_mark = input_mark[b, -1].detach().cpu().tolist()
-                    prompt = (
-                        "From {} to {}, values were [{}]. trend={:.4f}".format(
-                            start_mark, end_mark, values_str, trend
-                        )
-                    )
-                else:
-                    prompt = (
-                        "Given {} steps values [{}], trend is {:.4f}.".format(
-                            seq_len, values_str, trend
-                        )
-                    )
-                prompts.append(prompt)
+                start_date = self._format_prompt_date(input_mark[b, 0], resolved_data_name)
+                end_date = self._format_prompt_date(input_mark[b, seq_len - 1], resolved_data_name)
+
+                prompt = resolved_template.replace("value1, ..., valuen", values_str)
+                prompt = prompt.replace("Trends", trends_str)
+                prompt = prompt.replace("[t1]", start_date).replace("[t2]", end_date)
+
+                tokenized_prompt = tokenizer.encode(
+                    prompt,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=self.prompt_max_tokens,
+                ).to(ts_inputs.device)
+                max_token_count = max(max_token_count, int(tokenized_prompt.shape[1]))
+                tokenized_prompts.append((b, n, tokenized_prompt))
+
+        in_prompt_emb = torch.zeros(
+            (batch_size, max_token_count, self.external_prompt_dim, node_num),
+            dtype=torch.float32,
+            device=ts_inputs.device,
+        )
 
         with torch.no_grad():
-            tokenized = tokenizer(
-                prompts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=self.prompt_max_tokens,
-            )
-            tokenized = {k: v.to(ts_inputs.device) for k, v in tokenized.items()}
-            outputs = model(**tokenized).last_hidden_state  # [B*N, L, E]
-            attention_mask = tokenized["attention_mask"]
-            last_pos = attention_mask.sum(dim=1) - 1
-            gather_index = last_pos.view(-1, 1, 1).expand(-1, 1, outputs.shape[-1])
-            last_token = outputs.gather(dim=1, index=gather_index).squeeze(1)  # [B*N, E]
+            for b, n, tokenized_prompt in tokenized_prompts:
+                prompt_embeddings = model(tokenized_prompt).last_hidden_state
+                emb_dim = int(prompt_embeddings.shape[-1])
+                if emb_dim > self.external_prompt_dim:
+                    prompt_embeddings = prompt_embeddings[..., : self.external_prompt_dim]
+                elif emb_dim < self.external_prompt_dim:
+                    pad_dim = self.external_prompt_dim - emb_dim
+                    emb_pad = torch.zeros(
+                        prompt_embeddings.shape[0],
+                        prompt_embeddings.shape[1],
+                        pad_dim,
+                        dtype=prompt_embeddings.dtype,
+                        device=prompt_embeddings.device,
+                    )
+                    prompt_embeddings = torch.cat([prompt_embeddings, emb_pad], dim=-1)
 
-        emb = last_token.view(batch_size, node_num, -1)
-        if emb.shape[-1] != self.external_prompt_dim:
-            if emb.shape[-1] > self.external_prompt_dim:
-                emb = emb[..., : self.external_prompt_dim]
-            else:
-                pad = emb.new_zeros(batch_size, node_num, self.external_prompt_dim - emb.shape[-1])
-                emb = torch.cat([emb, pad], dim=-1)
-        emb = emb.permute(0, 2, 1).unsqueeze(-1).contiguous()
-        return emb
+                padding_length = max_token_count - int(tokenized_prompt.shape[1])
+                if padding_length > 0:
+                    last_token_embedding = prompt_embeddings[:, -1:, :]
+                    padding = last_token_embedding.repeat(1, padding_length, 1)
+                    prompt_embeddings = torch.cat([prompt_embeddings, padding], dim=1)
+
+                in_prompt_emb[b, :max_token_count, :, n] = prompt_embeddings.squeeze(0)
+
+        last_token_emb = in_prompt_emb[:, max_token_count - 1, :, :]
+        return last_token_emb.unsqueeze(-1).contiguous()
 
     def _pool_prompt(self, prompt_inputs):
         if self.prompt_dim == 0:
-            return self.prompt_missing.expand(prompt_inputs.shape[0], -1, -1)
+            prompt = self.prompt_missing.expand(prompt_inputs.shape[0], -1, -1)
+            prompt = self.prompt_encoder(prompt)
+            return prompt.permute(0, 2, 1).contiguous()
 
         if self.prompt_pool == "last":
             prompt = prompt_inputs[:, -1]
@@ -296,7 +415,7 @@ class TimeCMA(BaseModel):
 
         prompt = self.prompt_proj(prompt)
         prompt = self.prompt_encoder(prompt)
-        return self.prompt_to_channel(prompt)
+        return prompt.permute(0, 2, 1).contiguous()
 
     def _encode_external_embeddings(self, embeddings):
         if embeddings.dim() == 4 and embeddings.shape[-1] == 1:
@@ -322,38 +441,41 @@ class TimeCMA(BaseModel):
                 )
             )
 
-        prompt = self.external_prompt_proj(emb_bnE)
-        prompt = self.prompt_encoder(prompt)
-        return self.prompt_to_channel(prompt)
+        prompt = self.prompt_encoder(emb_bnE)
+        return prompt.permute(0, 2, 1).contiguous()
 
     def forward(self, inputs, label=None, embeddings=None):
-        ts_inputs = inputs[..., : self.ts_dim]
-        prompt_inputs = inputs[..., self.ts_dim :]
+        ts_inputs = inputs[..., : self.ts_dim].float()
+        prompt_inputs = inputs[..., self.ts_dim :].float()
 
-        target_history = ts_inputs[..., :1].squeeze(-1)
-        norm_target = self.normalize_layer(target_history, "norm").unsqueeze(-1)
+        target_history = ts_inputs[..., 0]
+        norm_target = self.normalize_layer(target_history, "norm")
 
-        if self.ts_dim > 1:
-            ts_inputs = torch.cat([norm_target, ts_inputs[..., 1:]], dim=-1)
-        else:
-            ts_inputs = norm_target
-
-        batch_size = ts_inputs.shape[0]
-        ts_tokens = ts_inputs.permute(0, 2, 1, 3).reshape(batch_size, self.node_num, self.seq_len * self.ts_dim)
-        ts_tokens = self.history_proj(ts_tokens)
+        batch_size = norm_target.shape[0]
+        ts_tokens = norm_target.permute(0, 2, 1).contiguous()
+        ts_tokens = self.length_to_feature(ts_tokens)
         ts_tokens = self.ts_encoder(ts_tokens)
+        ts_tokens = ts_tokens.permute(0, 2, 1).contiguous()
 
         if embeddings is not None:
             prompt_tokens = self._encode_external_embeddings(embeddings)
         else:
             prompt_tokens = self._pool_prompt(prompt_inputs)
         cross_tokens = self.cross(ts_tokens, prompt_tokens, prompt_tokens)
-        decoded = self.decoder(cross_tokens, cross_tokens)
+        decoded = self.decoder(
+            cross_tokens.permute(0, 2, 1).contiguous(),
+            cross_tokens.permute(0, 2, 1).contiguous(),
+        )
 
         output = self.projection(decoded)
         output = output.view(batch_size, self.node_num, self.horizon, self.output_dim)
         output = output.permute(0, 2, 1, 3).contiguous()
-        output = self.normalize_layer(output.squeeze(-1), "denorm").unsqueeze(-1)
+        output_view = output.permute(0, 1, 3, 2).reshape(
+            batch_size, self.horizon * self.output_dim, self.node_num
+        )
+        output_view = self.normalize_layer(output_view, "denorm")
+        output = output_view.view(batch_size, self.horizon, self.output_dim, self.node_num)
+        output = output.permute(0, 1, 3, 2).contiguous()
         return output
 
 

@@ -81,8 +81,9 @@ The current implementation keeps the repository dependency-free: the paper's cau
 
 To run the TimeCMA adaptation, you may execute:
 ```
-python experiments/timecma/main.py --device cuda:0 --dataset SD --years 2019 --model_name timecma --seed 2023 --bs 32 --input_dim 3 --ts_dim 3 --prompt_dim 0
+python experiments/timecma/main.py --device cuda:0 --dataset SD --years 2019 --model_name timecma --input_dim 3 --ts_dim 3 --prompt_dim 0 --run_tag official_base
 ```
+This TimeCMA integration now follows the official training recipe more closely: `AdamW`, `CosineAnnealingLR`, `masked_mse` training loss, `bs=16`, `channel=32`, `d_ff=32`, `dropout=0.2`, `patience=50`, and isolated experiment folders by `dataset/seq_len/horizon/run_tag`. To stay compatible with LargeST tensors, the first `ts` channel is treated as the main scalar series per node, which matches the original TimeCMA assumption.
 
 To use prompt-aligned embeddings from the original [TimeCMA](https://github.com/ChenxiLiu-HNU/TimeCMA) setting, append them to the feature dimension of `his.npz`. Then set:
 ```
@@ -90,15 +91,15 @@ input_dim = ts_dim + prompt_dim
 ```
 For example, with 3 traffic channels and 64 prompt channels:
 ```
-python experiments/timecma/main.py --device cuda:0 --dataset SD --years 2019 --model_name timecma --seed 2023 --bs 16 --input_dim 67 --ts_dim 3 --prompt_dim 64 --prompt_hidden 128 --prompt_pool mean
+python experiments/timecma/main.py --device cuda:0 --dataset SD --years 2019 --model_name timecma --input_dim 67 --ts_dim 3 --prompt_dim 64 --prompt_hidden 128 --prompt_pool mean --run_tag inline_prompt
 ```
-This repository version keeps the TimeCMA dual-branch encoding and cross-modal alignment, and now supports two prompt-embedding modes:
+This repository version keeps the official TimeCMA dual-branch layout and now supports two prompt-embedding modes:
 - inline prompt channels appended to `his.npz` (as above), or
 - external embeddings (official-style) passed to `forward` via dataloader.
 
 To generate external prompt embeddings in the repository:
 ```
-python scripts/generate_timecma_prompt_embeddings.py --data_path data/sd --years 2019 --ts_dim 3 --seq_len 12 --embedding_method gpt2 --device cuda:0
+python scripts/generate_timecma_prompt_embeddings.py --data_path data/sd --years 2019 --ts_dim 3 --seq_len 12 --embedding_method gpt2 --d_llm 768 --external_prompt_dim 768 --data_name SD --start_datetime '2019-01-01 00:00:00' --freq_minutes 5 --device cuda:0
 ```
 This script saves:
 ```
@@ -108,23 +109,41 @@ data/sd/2019/prompt_emb_test.npy
 ```
 Then train TimeCMA with:
 ```
-python experiments/timecma/main.py --device cuda:0 --dataset SD --years 2019 --model_name timecma --seed 2023 --bs 16 --input_dim 3 --ts_dim 3 --prompt_dim 0 --use_external_embeddings 1 --embedding_prefix prompt_emb --external_prompt_dim 768
+python experiments/timecma/main.py --device cuda:0 --dataset SD --years 2019 --model_name timecma --input_dim 3 --ts_dim 3 --prompt_dim 0 --use_external_embeddings 1 --embedding_prefix prompt_emb --d_llm 768 --external_prompt_dim 768 --prompt_data_name SD --prompt_start_datetime '2019-01-01 00:00:00' --prompt_freq_minutes 5 --run_tag official_external
+```
+For custom dataset folders, pass `--data_path` and (optionally) `--node_num`:
+```
+python experiments/timecma/main.py --device cuda:0 --dataset SD --data_path /path/to/your_dataset --node_num 517 --years 2023 --model_name timecma --input_dim 1 --ts_dim 1 --prompt_dim 0 --use_external_embeddings 1 --embedding_prefix prompt_emb --d_llm 768 --external_prompt_dim 768 --prompt_data_name Sacramento --prompt_start_datetime '2023-01-01 00:00:00' --prompt_freq_minutes 5 --run_tag sacra_external
 ```
 You can also skip pre-saving and generate embeddings online during training:
 ```
-python experiments/timecma/main.py --device cuda:0 --dataset SD --years 2019 --model_name timecma --seed 2023 --bs 8 --input_dim 3 --ts_dim 3 --prompt_dim 0 --generate_embeddings_on_the_fly 1 --embedding_method gpt2 --external_prompt_dim 768
+python experiments/timecma/main.py --device cuda:0 --dataset SD --years 2019 --model_name timecma --input_dim 3 --ts_dim 3 --prompt_dim 0 --generate_embeddings_on_the_fly 1 --embedding_method gpt2 --d_llm 768 --external_prompt_dim 768 --prompt_data_name SD --prompt_start_datetime '2019-01-01 00:00:00' --prompt_freq_minutes 5 --run_tag official_online
 ```
 Since TimeCMA uses node-wise attention and prompt generation can be expensive, it is best validated on smaller subsets such as SD first.
 
-To run the Time-LLM adaptation, you may execute:
+To run the Time-LLM integration, you may execute:
 ```
-python experiments/timellm/main.py --device cuda:0 --dataset SD --years 2019 --model_name timellm --seed 2023 --bs 16 --seq_len 12 --horizon 12 --input_dim 3 --traffic_dim 3
+python experiments/timellm/main.py --device cuda:0 --dataset SD --years 2019 --model_name timellm --seed 2023 --bs 16 --seq_len 12 --horizon 12 --input_dim 3 --traffic_dim 3 --llm_model GPT2 --prompt_mode stats --prompt_granularity batch
 ```
 For flow-only data (e.g., custom Sacramento subset), set `input_dim=traffic_dim=1` and pass a custom dataset root:
 ```
-python experiments/timellm/main.py --device cuda:0 --dataset Sacra --years 2023 --model_name timellm --seed 2023 --bs 16 --seq_len 12 --horizon 12 --input_dim 1 --traffic_dim 1 --data_path /path/to/data_root --node_num 517
+python experiments/timellm/main.py --device cuda:0 --dataset Sacra --years 2023 --model_name timellm --seed 2023 --bs 16 --seq_len 12 --horizon 12 --input_dim 1 --traffic_dim 1 --data_path /path/to/data_root --node_num 517 --llm_model GPT2 --prompt_mode stats --prompt_granularity batch
 ```
-This repository version keeps Time-LLM's patch reprogramming and prompt-token conditioning idea, while replacing heavyweight external LLM dependencies with a lightweight Transformer backbone for direct integration into LargeST.
+This repository version keeps Time-LLM's patch reprogramming and prompt-token conditioning idea, and supports loading GPT2/BERT/LLAMA backbones from HuggingFace (with local-files-first behavior configurable by runtime flags).
+
+To enable SwanLab logging for training and testing metrics, append:
+```
+--use_swanlab 1 --swanlab_project LargeST --swanlab_experiment timellm_run_name
+```
+For heavy backbones on large node sets, it is recommended to sparsify training windows:
+```
+--node_chunk_size 8 --train_sample_stride 48 --val_sample_stride 12 --test_sample_stride 12 --log_interval 10
+```
+For Sacramento flow-only data with LLAMA 32 layers (12->12):
+```
+export HF_ENDPOINT=https://hf-mirror.com
+python experiments/timellm/main.py --device cuda:0 --dataset Sacra --years 2023 --model_name timellm --seed 2023 --bs 1 --seq_len 12 --horizon 12 --input_dim 1 --traffic_dim 1 --data_path /root/XTraffic/data/processed_y2023_sacramento --node_num 517 --llm_model LLAMA --llm_layers 32 --llm_model_name huggyllama/llama-7b --llm_local_files_only 1 --llm_allow_download 1 --llm_torch_dtype float16 --prompt_mode stats --prompt_granularity batch --node_chunk_size 8 --train_sample_stride 48 --val_sample_stride 12 --test_sample_stride 12 --log_interval 10 --freeze_backbone 1 --use_swanlab 1 --swanlab_project LargeST --swanlab_experiment timellm_sacra_llama32_12to12
+```
 
 To run the ST-LLM adaptation (only ST_LLM model from [ST-LLM](https://github.com/ChenxiLiu-HNU/ST-LLM)), you may execute:
 ```

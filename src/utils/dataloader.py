@@ -151,6 +151,7 @@ class DataLoaderWithEmbedding(DataLoader):
         bs,
         logger,
         embeddings=None,
+        return_batch_indices=False,
         pad_last_sample=False,
     ):
         if embeddings is not None and pad_last_sample:
@@ -168,6 +169,7 @@ class DataLoaderWithEmbedding(DataLoader):
             pad_last_sample=pad_last_sample,
         )
         self.embeddings = embeddings
+        self.return_batch_indices = bool(return_batch_indices)
 
     def shuffle(self):
         perm = np.random.permutation(self.size)
@@ -212,7 +214,10 @@ class DataLoaderWithEmbedding(DataLoader):
                 embedding_batch = None
                 if self.embeddings is not None:
                     embedding_batch = self.embeddings[start_ind:end_ind]
-                yield (x, y, embedding_batch)
+                if self.return_batch_indices:
+                    yield (x, y, embedding_batch, idx_ind.copy())
+                else:
+                    yield (x, y, embedding_batch)
                 self.current_ind += 1
 
         return _wrapper()
@@ -316,6 +321,104 @@ class DataLoaderSTLLM(DataLoader):
         return _wrapper()
 
 
+class DataLoaderE2CSTPStaticText(DataLoader):
+    def __init__(
+        self,
+        data,
+        idx,
+        seq_len,
+        horizon,
+        bs,
+        logger,
+        text_embeddings,
+        image_dim=0,
+        pad_last_sample=False,
+    ):
+        super(DataLoaderE2CSTPStaticText, self).__init__(
+            data=data,
+            idx=idx,
+            seq_len=seq_len,
+            horizon=horizon,
+            bs=bs,
+            logger=logger,
+            pad_last_sample=pad_last_sample,
+        )
+        if text_embeddings is None:
+            raise ValueError("text_embeddings must not be None")
+        if text_embeddings.ndim != 2:
+            raise ValueError("text_embeddings must be [N, D], got {}".format(text_embeddings.shape))
+        if text_embeddings.shape[0] != data.shape[1]:
+            raise ValueError(
+                "text_embeddings node num mismatch: {} vs {}".format(
+                    text_embeddings.shape[0], data.shape[1]
+                )
+            )
+
+        self.base_feature_dim = data.shape[-1]
+        self.text_embeddings = text_embeddings.astype(np.float32, copy=False)
+        self.text_dim = int(self.text_embeddings.shape[1])
+        self.image_dim = max(0, int(image_dim))
+        self.total_feature_dim = self.base_feature_dim + self.text_dim + self.image_dim
+
+        logger.info(
+            "E2CSTP static text enabled: base_dim={}, text_dim={}, image_dim={}, input_dim={}".format(
+                self.base_feature_dim, self.text_dim, self.image_dim, self.total_feature_dim
+            )
+        )
+
+    def write_to_shared_array(self, x, y, idx_ind, start_idx, end_idx):
+        text_start = self.base_feature_dim
+        text_end = text_start + self.text_dim
+        image_start = text_end
+
+        for i in range(start_idx, end_idx):
+            history_index = idx_ind[i] + self.x_offsets
+            x[i, :, :, : self.base_feature_dim] = self.data[history_index, :, :]
+            x[i, :, :, text_start:text_end] = self.text_embeddings[None, :, :]
+            if self.image_dim > 0:
+                x[i, :, :, image_start:] = 0.0
+            y[i] = self.data[idx_ind[i] + self.y_offsets, :, :1]
+
+    def get_iterator(self):
+        self.current_ind = 0
+
+        def _wrapper():
+            while self.current_ind < self.num_batch:
+                start_ind = self.bs * self.current_ind
+                end_ind = min(self.size, self.bs * (self.current_ind + 1))
+                idx_ind = self.idx[start_ind: end_ind, ...]
+
+                x_shape = (len(idx_ind), self.seq_len, self.data.shape[1], self.total_feature_dim)
+                x_shared = mp.RawArray('f', int(np.prod(x_shape)))
+                x = np.frombuffer(x_shared, dtype='f').reshape(x_shape)
+
+                y_shape = (len(idx_ind), self.horizon, self.data.shape[1], 1)
+                y_shared = mp.RawArray('f', int(np.prod(y_shape)))
+                y = np.frombuffer(y_shared, dtype='f').reshape(y_shape)
+
+                array_size = len(idx_ind)
+                num_threads = max(1, len(idx_ind) // 2)
+                chunk_size = max(1, array_size // num_threads)
+                threads = []
+                for i in range(num_threads):
+                    start_index = i * chunk_size
+                    end_index = start_index + chunk_size if i < num_threads - 1 else array_size
+                    thread = threading.Thread(
+                        target=self.write_to_shared_array,
+                        args=(x, y, idx_ind, start_index, end_index),
+                    )
+                    thread.start()
+                    threads.append(thread)
+
+                for thread in threads:
+                    thread.join()
+
+                yield (x, y)
+                self.current_ind += 1
+
+        return _wrapper()
+
+
 class StandardScaler():
     def __init__(self, mean, std):
         self.mean = torch.tensor(mean)
@@ -330,6 +433,42 @@ class StandardScaler():
         return (data * self.std) + self.mean
 
 
+def _apply_idx_sampling(idx, args, logger, cat, aligned_arrays=None):
+    stride = max(1, int(getattr(args, '{}_sample_stride'.format(cat), 1)))
+    limit = int(getattr(args, '{}_sample_limit'.format(cat), 0))
+    sampled_idx = idx[::stride] if stride > 1 else idx
+
+    sampled_aligned = None
+    if aligned_arrays is not None:
+        sampled_aligned = []
+        for array in aligned_arrays:
+            if array is None:
+                sampled_aligned.append(None)
+            else:
+                sampled_aligned.append(array[::stride] if stride > 1 else array)
+
+    if limit > 0 and len(sampled_idx) > limit:
+        sampled_idx = sampled_idx[:limit]
+        if sampled_aligned is not None:
+            sampled_aligned = [
+                None if array is None else array[:limit] for array in sampled_aligned
+            ]
+
+    if stride > 1 or limit > 0:
+        logger.info(
+            '{} idx sampled: original={}, stride={}, limit={}, sampled={}'.format(
+                cat,
+                len(idx),
+                stride,
+                limit,
+                len(sampled_idx),
+            )
+        )
+    if sampled_aligned is None:
+        return sampled_idx
+    return sampled_idx, sampled_aligned
+
+
 def load_dataset(data_path, args, logger):
     ptr = np.load(os.path.join(data_path, args.years, 'his.npz'))
     logger.info('Data shape: ' + str(ptr['data'].shape))
@@ -337,6 +476,7 @@ def load_dataset(data_path, args, logger):
     dataloader = {}
     for cat in ['train', 'val', 'test']:
         idx = np.load(os.path.join(data_path, args.years, 'idx_' + cat + '.npy'))
+        idx = _apply_idx_sampling(idx, args, logger, cat)
         dataloader[cat + '_loader'] = DataLoader(ptr['data'][..., :args.input_dim], idx, \
                                                  args.seq_len, args.horizon, args.bs, logger)
 
@@ -372,6 +512,10 @@ def load_dataset_with_embeddings(data_path, args, logger, embedding_prefix='prom
                     cat, embedding_path
                 )
             )
+        idx, sampled = _apply_idx_sampling(
+            idx, args, logger, cat, aligned_arrays=[embeddings]
+        )
+        embeddings = sampled[0]
 
         dataloader[cat + '_loader'] = DataLoaderWithEmbedding(
             ptr['data'][..., :args.input_dim],
@@ -381,6 +525,7 @@ def load_dataset_with_embeddings(data_path, args, logger, embedding_prefix='prom
             args.bs,
             logger,
             embeddings=embeddings,
+            return_batch_indices=bool(getattr(args, "generate_embeddings_on_the_fly", 0)),
         )
 
     scaler = StandardScaler(mean=ptr['mean'], std=ptr['std'])
@@ -405,6 +550,10 @@ def load_dataset_with_reports(data_path, args, logger, report_prefix='report'):
                         cat, len(report_targets), len(idx)
                     )
                 )
+        idx, sampled = _apply_idx_sampling(
+            idx, args, logger, cat, aligned_arrays=[report_targets]
+        )
+        report_targets = sampled[0]
         dataloader[cat + '_loader'] = DataLoaderWithReport(
             ptr['data'][..., :args.input_dim],
             idx,
@@ -436,6 +585,7 @@ def load_dataset_for_stllm(
     dataloader = {}
     for cat in ['train', 'val', 'test']:
         idx = np.load(os.path.join(data_path, args.years, 'idx_' + cat + '.npy'))
+        idx = _apply_idx_sampling(idx, args, logger, cat)
         dataloader[cat + '_loader'] = DataLoaderSTLLM(
             base_data,
             idx,
@@ -447,6 +597,35 @@ def load_dataset_for_stllm(
             add_time_of_day=add_time_of_day,
             add_day_of_week=add_day_of_week,
             time_start_offset=time_start_offset,
+        )
+
+    scaler = StandardScaler(mean=ptr['mean'], std=ptr['std'])
+    return dataloader, scaler
+
+
+def load_dataset_for_e2cstp_static_text(
+    data_path,
+    args,
+    logger,
+    text_embeddings,
+):
+    ptr = np.load(os.path.join(data_path, args.years, 'his.npz'))
+    logger.info('Data shape: ' + str(ptr['data'].shape))
+
+    base_data = ptr['data'][..., :args.st_dim]
+    dataloader = {}
+    for cat in ['train', 'val', 'test']:
+        idx = np.load(os.path.join(data_path, args.years, 'idx_' + cat + '.npy'))
+        idx = _apply_idx_sampling(idx, args, logger, cat)
+        dataloader[cat + '_loader'] = DataLoaderE2CSTPStaticText(
+            base_data,
+            idx,
+            args.seq_len,
+            args.horizon,
+            args.bs,
+            logger,
+            text_embeddings=text_embeddings,
+            image_dim=args.image_dim,
         )
 
     scaler = StandardScaler(mean=ptr['mean'], std=ptr['std'])

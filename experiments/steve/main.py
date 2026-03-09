@@ -15,6 +15,7 @@ from src.utils.args import get_public_config
 from src.utils.dataloader import get_dataset_info
 from src.utils.dataloader import load_adj_from_numpy
 from src.utils.dataloader import load_dataset
+from src.utils.experiment_naming import build_experiment_dir_name
 from src.utils.graph_algo import normalize_adj_mx
 from src.utils.logging import get_logger
 from src.utils.metrics import masked_mae
@@ -34,6 +35,7 @@ def get_config():
     parser.add_argument("--data_path", type=str, default="")
     parser.add_argument("--adj_path", type=str, default="")
     parser.add_argument("--node_num", type=int, default=0)
+    parser.add_argument("--run_tag", type=str, default="")
 
     parser.add_argument("--traffic_dim", type=int, default=3)
     parser.add_argument("--embed_dim", type=int, default=64)
@@ -66,7 +68,18 @@ def get_config():
             "traffic_dim must be <= input_dim, got {} > {}".format(args.traffic_dim, args.input_dim)
         )
 
-    folder_name = "{}-{}-{}".format(args.dataset, args.traffic_dim, args.embed_dim)
+    folder_name = build_experiment_dir_name(
+        dataset=args.dataset,
+        years=args.years,
+        seq_len=args.seq_len,
+        horizon=args.horizon,
+        seed=args.seed,
+        extra_parts=[
+            ("flow", args.traffic_dim),
+            ("emb", args.embed_dim),
+        ],
+        run_tag=args.run_tag,
+    )
     log_dir = "./experiments/{}/{}/".format(args.model_name, folder_name)
     logger = get_logger(log_dir, __name__, "record_s{}.log".format(args.seed))
     logger.info(args)

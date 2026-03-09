@@ -28,9 +28,9 @@ def normalize_adj_mx(adj_mx, adj_type, return_type='dense'):
 
 def calculate_normalized_laplacian(adj_mx):
     adj_mx = sp.coo_matrix(adj_mx)
-    d = np.array(adj_mx.sum(1))
-    d_inv_sqrt = np.power(d, -0.5).flatten()
-    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
+    rowsum = np.array(adj_mx.sum(1)).flatten().astype(np.float64)
+    d_inv_sqrt = np.zeros_like(rowsum)
+    np.divide(1.0, np.sqrt(rowsum), out=d_inv_sqrt, where=rowsum > 0)
     d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
     res = sp.eye(adj_mx.shape[0]) - d_mat_inv_sqrt.dot(adj_mx).dot(d_mat_inv_sqrt).tocoo()
     return res
@@ -52,9 +52,9 @@ def calculate_scaled_laplacian(adj_mx, lambda_max=None, undirected=True):
 
 def calculate_sym_adj(adj_mx):
     adj_mx = sp.coo_matrix(adj_mx)
-    rowsum = np.array(adj_mx.sum(1))
-    d_inv_sqrt = np.power(rowsum, -0.5).flatten()
-    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
+    rowsum = np.array(adj_mx.sum(1)).flatten().astype(np.float64)
+    d_inv_sqrt = np.zeros_like(rowsum)
+    np.divide(1.0, np.sqrt(rowsum), out=d_inv_sqrt, where=rowsum > 0)
     d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
     res = d_mat_inv_sqrt.dot(adj_mx).dot(d_mat_inv_sqrt)
     return res
@@ -62,9 +62,9 @@ def calculate_sym_adj(adj_mx):
 
 def calculate_asym_adj(adj_mx):
     adj_mx = sp.coo_matrix(adj_mx)
-    rowsum = np.array(adj_mx.sum(1)).flatten()
-    d_inv = np.power(rowsum, -1).flatten()
-    d_inv[np.isinf(d_inv)] = 0.
+    rowsum = np.array(adj_mx.sum(1)).flatten().astype(np.float64)
+    d_inv = np.zeros_like(rowsum)
+    np.divide(1.0, rowsum, out=d_inv, where=rowsum > 0)
     d_mat_inv = sp.diags(d_inv)
     res = d_mat_inv.dot(adj_mx)
     return res

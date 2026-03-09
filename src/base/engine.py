@@ -6,10 +6,12 @@ import numpy as np
 from src.utils.metrics import masked_mape
 from src.utils.metrics import masked_rmse
 from src.utils.metrics import compute_all_metrics
+from src.utils.swanlab_tracker import SwanLabTracker
 
 class BaseEngine():
     def __init__(self, device, model, dataloader, scaler, sampler, loss_fn, lrate, optimizer, \
-                 scheduler, clip_grad_value, max_epochs, patience, log_dir, logger, seed):
+                 scheduler, clip_grad_value, max_epochs, patience, log_dir, logger, seed, \
+                 swanlab_cfg=None, log_interval=0):
         super().__init__()
         self._device = device
         self.model = model
@@ -30,8 +32,24 @@ class BaseEngine():
         self._save_path = log_dir
         self._logger = logger
         self._seed = seed
+        self._log_interval = max(0, int(log_interval))
 
         self._logger.info('The number of parameters: {}'.format(self.model.param_num())) 
+        if swanlab_cfg is None:
+            swanlab_cfg = {}
+        default_exp_name = "{}-s{}".format(self.model.__class__.__name__, self._seed)
+        self._swanlab = SwanLabTracker(
+            enabled=swanlab_cfg.get("enabled", False),
+            logger=self._logger,
+            project=swanlab_cfg.get("project", "LargeST"),
+            experiment_name=swanlab_cfg.get("experiment_name", default_exp_name),
+            config=swanlab_cfg.get("config", {}),
+            mode=swanlab_cfg.get("mode", "cloud"),
+            logdir=swanlab_cfg.get("logdir", self._save_path),
+        )
+
+    def close(self):
+        self._swanlab.finish()
 
 
     def _to_device(self, tensors):
@@ -69,13 +87,25 @@ class BaseEngine():
         if not os.path.exists(save_path):
             os.makedirs(save_path)
         filename = 'final_model_s{}.pt'.format(self._seed)
-        torch.save(self.model.state_dict(), os.path.join(save_path, filename))
+        state_dict = self.model.state_dict()
+        if bool(getattr(self.model, "checkpoint_trainable_only", False)):
+            trainable_names = {name for name, p in self.model.named_parameters() if p.requires_grad}
+            state_dict = {k: v for k, v in state_dict.items() if k in trainable_names}
+            self._logger.info(
+                "Save trainable-only checkpoint with {} tensors.".format(len(state_dict))
+            )
+        torch.save(state_dict, os.path.join(save_path, filename))
 
 
     def load_model(self, save_path):
         filename = 'final_model_s{}.pt'.format(self._seed)
-        self.model.load_state_dict(torch.load(
-            os.path.join(save_path, filename)))   
+        ckpt_path = os.path.join(save_path, filename)
+        try:
+            state_dict = torch.load(ckpt_path, map_location=self._device, weights_only=True)
+        except TypeError:
+            state_dict = torch.load(ckpt_path, map_location=self._device)
+        strict = not bool(getattr(self.model, "checkpoint_trainable_only", False))
+        self.model.load_state_dict(state_dict, strict=strict)
 
 
     def train_batch(self):
@@ -85,7 +115,9 @@ class BaseEngine():
         train_mape = []
         train_rmse = []
         self._dataloader['train_loader'].shuffle()
-        for X, label in self._dataloader['train_loader'].get_iterator():
+        total_batch = self._dataloader['train_loader'].num_batch
+        start_time = time.time()
+        for batch_idx, (X, label) in enumerate(self._dataloader['train_loader'].get_iterator(), start=1):
             self._optimizer.zero_grad()
 
             # X (b, t, n, f), label (b, t, n, 1)
@@ -114,6 +146,26 @@ class BaseEngine():
             train_rmse.append(rmse)
 
             self._iter_cnt += 1
+            if self._log_interval > 0 and (
+                batch_idx == 1
+                or batch_idx % self._log_interval == 0
+                or batch_idx == total_batch
+            ):
+                elapsed = time.time() - start_time
+                avg_batch_time = elapsed / batch_idx
+                eta = avg_batch_time * max(total_batch - batch_idx, 0)
+                self._logger.info(
+                    "Train Batch {}/{}, Loss {:.4f}, RMSE {:.4f}, MAPE {:.4f}, "
+                    "Avg {:.2f}s/batch, ETA {:.1f} min".format(
+                        batch_idx,
+                        total_batch,
+                        np.mean(train_loss),
+                        np.mean(train_rmse),
+                        np.mean(train_mape),
+                        avg_batch_time,
+                        eta / 60.0,
+                    )
+                )
         return np.mean(train_loss), np.mean(train_mape), np.mean(train_rmse)
 
 
@@ -141,16 +193,44 @@ class BaseEngine():
             self._logger.info(message.format(epoch + 1, mtrain_loss, mtrain_rmse, mtrain_mape, \
                                              mvalid_loss, mvalid_rmse, mvalid_mape, \
                                              (t2 - t1), (v2 - v1), cur_lr))
+            self._swanlab.log(
+                {
+                    "train/loss": mtrain_loss,
+                    "train/rmse": mtrain_rmse,
+                    "train/mape": mtrain_mape,
+                    "val/loss": mvalid_loss,
+                    "val/rmse": mvalid_rmse,
+                    "val/mape": mvalid_mape,
+                    "train/epoch_time_sec": (t2 - t1),
+                    "val/epoch_time_sec": (v2 - v1),
+                    "train/lr": cur_lr,
+                },
+                step=epoch + 1,
+            )
 
             if mvalid_loss < min_loss:
                 self.save_model(self._save_path)
                 self._logger.info('Val loss decrease from {:.4f} to {:.4f}'.format(min_loss, mvalid_loss))
                 min_loss = mvalid_loss
                 wait = 0
+                self._swanlab.log(
+                    {
+                        "val/best_loss": min_loss,
+                        "val/best_epoch": epoch + 1,
+                    },
+                    step=epoch + 1,
+                )
             else:
                 wait += 1
                 if wait == self._patience:
                     self._logger.info('Early stop at epoch {}, loss = {:.6f}'.format(epoch + 1, min_loss))
+                    self._swanlab.log(
+                        {
+                            "train/early_stop_epoch": epoch + 1,
+                            "val/best_loss": min_loss,
+                        },
+                        step=epoch + 1,
+                    )
                     break
 
         self.evaluate('test')
@@ -199,6 +279,24 @@ class BaseEngine():
                 test_mae.append(res[0])
                 test_mape.append(res[1])
                 test_rmse.append(res[2])
+                self._swanlab.log(
+                    {
+                        "test/horizon_{}/mae".format(i + 1): res[0],
+                        "test/horizon_{}/rmse".format(i + 1): res[2],
+                        "test/horizon_{}/mape".format(i + 1): res[1],
+                    },
+                    step=i + 1,
+                )
 
+            avg_mae = np.mean(test_mae)
+            avg_rmse = np.mean(test_rmse)
+            avg_mape = np.mean(test_mape)
             log = 'Average Test MAE: {:.4f}, Test RMSE: {:.4f}, Test MAPE: {:.4f}'
-            self._logger.info(log.format(np.mean(test_mae), np.mean(test_rmse), np.mean(test_mape)))
+            self._logger.info(log.format(avg_mae, avg_rmse, avg_mape))
+            self._swanlab.log(
+                {
+                    "test/avg_mae": avg_mae,
+                    "test/avg_rmse": avg_rmse,
+                    "test/avg_mape": avg_mape,
+                }
+            )
