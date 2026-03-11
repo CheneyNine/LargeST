@@ -1,4 +1,3 @@
-import glob
 import os
 import numpy as np
 
@@ -11,15 +10,13 @@ import torch
 torch.set_num_threads(3)
 
 from src.base.engine import BaseEngine
-from src.models.stgcn import STGCN
+from src.models.gpt4ts import GPT4TS
 from src.utils.args import get_public_config
 from src.utils.dataloader import get_dataset_info
-from src.utils.dataloader import load_adj_from_numpy
 from src.utils.dataloader import load_dataset
 from src.utils.experiment_naming import build_experiment_dir_name
-from src.utils.graph_algo import normalize_adj_mx
 from src.utils.logging import get_logger
-from src.utils.metrics import masked_mae
+from src.utils.metrics import masked_mse
 from src.utils.swanlab_tracker import resolve_swanlab_job_type
 
 
@@ -31,31 +28,30 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def infer_adj_path(data_path):
-    candidates = sorted(glob.glob(os.path.join(data_path, "*adj*.npy")))
-    if candidates:
-        return candidates[0]
-    return ""
-
-
 def get_config():
     parser = get_public_config()
+    parser.set_defaults(bs=16, max_epochs=10, patience=3)
     parser.add_argument("--data_path", type=str, default="")
     parser.add_argument("--node_num", type=int, default=0)
-    parser.add_argument("--adj_path", type=str, default="")
     parser.add_argument("--run_tag", type=str, default="")
     parser.add_argument("--experiment_timestamp", type=str, default="")
 
-    parser.add_argument("--Kt", type=int, default=3)
-    parser.add_argument("--Ks", type=int, default=3)
-    parser.add_argument("--block_num", type=int, default=2)
-    parser.add_argument("--step_size", type=int, default=10)
-    parser.add_argument("--gamma", type=float, default=0.95)
+    parser.add_argument("--traffic_dim", type=int, default=1)
+    parser.add_argument("--d_model", type=int, default=768)
+    parser.add_argument("--patch_size", type=int, default=16)
+    parser.add_argument("--stride", type=int, default=8)
+    parser.add_argument("--gpt_layers", type=int, default=6)
+    parser.add_argument("--is_gpt", type=int, default=1)
+    parser.add_argument("--pretrain", type=int, default=1)
+    parser.add_argument("--freeze", type=int, default=1)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--gpt_model_name", type=str, default="gpt2")
+    parser.add_argument("--gpt_local_files_only", type=int, default=1)
+    parser.add_argument("--gpt_allow_download", type=int, default=1)
 
     parser.add_argument("--lrate", type=float, default=1e-3)
-    parser.add_argument("--wdecay", type=float, default=5e-4)
-    parser.add_argument("--dropout", type=float, default=0.5)
-    parser.add_argument("--clip_grad_value", type=float, default=0)
+    parser.add_argument("--wdecay", type=float, default=1e-4)
+    parser.add_argument("--clip_grad_value", type=float, default=5)
     parser.add_argument("--use_swanlab", type=int, default=1)
     parser.add_argument("--swanlab_project", type=str, default="LargeST")
     parser.add_argument("--swanlab_experiment", type=str, default="")
@@ -74,8 +70,8 @@ def get_config():
         horizon=args.horizon,
         seed=args.seed,
         extra_parts=[
-            ("kt", args.Kt),
-            ("ks", args.Ks),
+            ("dm", args.d_model),
+            ("gpt", args.gpt_layers),
         ],
         run_tag=args.run_tag,
         started_at=str(args.experiment_timestamp).strip() or None,
@@ -94,17 +90,11 @@ def resolve_data_info(args, logger):
         else:
             ptr = np.load(os.path.join(data_path, args.years, "his.npz"))
             node_num = int(ptr["data"].shape[1])
-        adj_path = str(args.adj_path).strip() or infer_adj_path(data_path)
-        if not adj_path:
-            raise ValueError(
-                "adj_path is required for STGCN when using custom data_path, and no adjacency "
-                "matrix could be inferred from {}".format(data_path)
-            )
         logger.info("Use custom dataset path.")
-        return data_path, adj_path, node_num
+        return data_path, node_num
 
-    data_path, adj_path, node_num = get_dataset_info(args.dataset)
-    return data_path, adj_path, node_num
+    data_path, _, node_num = get_dataset_info(args.dataset)
+    return data_path, node_num
 
 
 def main():
@@ -112,40 +102,32 @@ def main():
     set_seed(args.seed)
     device = torch.device(args.device)
 
-    data_path, adj_path, node_num = resolve_data_info(args, logger)
-    logger.info("Adj path: " + adj_path)
-
-    adj_mx = load_adj_from_numpy(adj_path)
-    adj_mx = adj_mx - np.eye(node_num)
-    gso = normalize_adj_mx(adj_mx, "scalap")[0]
-    gso = torch.tensor(gso).to(device)
-
-    Ko = args.seq_len - (args.Kt - 1) * 2 * args.block_num
-    blocks = [[args.input_dim]]
-    for _ in range(args.block_num):
-        blocks.append([64, 16, 64])
-    if Ko == 0:
-        blocks.append([128])
-    elif Ko > 0:
-        blocks.append([128, 128])
-    blocks.append([args.horizon])
-
+    data_path, node_num = resolve_data_info(args, logger)
     dataloader, scaler = load_dataset(data_path, args, logger)
 
-    model = STGCN(
+    model = GPT4TS(
         node_num=node_num,
         input_dim=args.input_dim,
         output_dim=args.output_dim,
-        gso=gso,
-        blocks=blocks,
-        Kt=args.Kt,
-        Ks=args.Ks,
+        seq_len=args.seq_len,
+        horizon=args.horizon,
+        traffic_dim=args.traffic_dim,
+        d_model=args.d_model,
+        patch_size=args.patch_size,
+        stride=args.stride,
+        gpt_layers=args.gpt_layers,
+        is_gpt=args.is_gpt,
+        pretrain=args.pretrain,
+        freeze=args.freeze,
         dropout=args.dropout,
+        gpt_model_name=args.gpt_model_name,
+        gpt_local_files_only=args.gpt_local_files_only,
+        gpt_allow_download=args.gpt_allow_download,
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lrate, weight_decay=args.wdecay)
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=args.step_size, gamma=args.gamma
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=min(int(args.max_epochs), 10), eta_min=1e-8
     )
 
     engine = BaseEngine(
@@ -154,7 +136,7 @@ def main():
         dataloader=dataloader,
         scaler=scaler,
         sampler=None,
-        loss_fn=masked_mae,
+        loss_fn=masked_mse,
         lrate=args.lrate,
         optimizer=optimizer,
         scheduler=scheduler,
