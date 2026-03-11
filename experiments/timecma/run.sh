@@ -1,4 +1,9 @@
+#!/bin/bash
+
 # TimeCMA paper-style pipeline in LargeST
+# Override in shell:
+# DESC="SacraJan2023 q24->24 official GPT2 external" bash experiments/timecma/run.sh
+DESC="${DESC:-TimeCMA baseline}"
 # Official-aligned defaults:
 #   seed=2024, bs=16, channel=64, d_ff=32, lr=1e-4, weight_decay=1e-3,
 #   dropout=0.5, AdamW, CosineAnnealingLR, patience=50
@@ -37,9 +42,11 @@
 #   --prompt_dim 0 \
 #   --use_external_embeddings 1 \
 #   --embedding_prefix prompt_emb \
+#   --embedding_dir /public_data/LargeST_data/embeddings/timecma_sacra_jan_q12h12_emb \
 #   --d_llm 768 \
 #   --external_prompt_dim 768 \
 #   --prompt_data_name SACRA \
 #   --prompt_start_datetime '2023-01-01 00:00:00' \
 #   --prompt_freq_minutes 5 \
+#   --desc "$DESC" \
 #   --run_tag official_gpt2_external

@@ -1,8 +1,10 @@
 import os
 import re
+from datetime import datetime
 
 
 _TOKEN_RE = re.compile(r"[^A-Za-z0-9._+-]+")
+_TIMESTAMP_FORMATS = ("%y%m%d%H%M", "%Y%m%d%H%M", "%y%m%d%H%M%S", "%Y%m%d%H%M%S")
 
 
 def sanitize_experiment_token(value):
@@ -14,26 +16,56 @@ def sanitize_experiment_token(value):
     return text or "na"
 
 
-def build_experiment_dir_name(dataset, years, seq_len, horizon, seed, extra_parts=None, run_tag=""):
+def _build_dataset_token(dataset, years):
+    dataset_token = sanitize_experiment_token(dataset)
+    years_token = sanitize_experiment_token(years)
+    if years_token == "na":
+        return dataset_token
+    if dataset_token.lower().endswith(years_token.lower()):
+        return dataset_token
+    return "{}{}".format(dataset_token, years_token)
+
+
+def build_run_timestamp(started_at=None):
+    if started_at is None:
+        started_at = datetime.now()
+    elif isinstance(started_at, str):
+        value = started_at.strip()
+        parsed = None
+        for fmt in _TIMESTAMP_FORMATS:
+            try:
+                parsed = datetime.strptime(value, fmt)
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            raise ValueError("Invalid experiment timestamp: {}".format(started_at))
+        started_at = parsed
+    return started_at.strftime("%y%m%d%H%M")
+
+
+def build_experiment_dir_name(
+    model_name,
+    dataset,
+    years,
+    seq_len,
+    horizon,
+    seed,
+    extra_parts=None,
+    run_tag="",
+    started_at=None,
+):
+    del extra_parts
+    del run_tag
     parts = [
-        "ds-{}".format(sanitize_experiment_token(dataset)),
-        "yr-{}".format(sanitize_experiment_token(years)),
+        sanitize_experiment_token(model_name),
+        _build_dataset_token(dataset, years),
         "q{}".format(int(seq_len)),
         "h{}".format(int(horizon)),
         "s{}".format(int(seed)),
+        "t{}".format(build_run_timestamp(started_at)),
     ]
-    for label, value in extra_parts or []:
-        if value is None:
-            continue
-        parts.append(
-            "{}-{}".format(
-                sanitize_experiment_token(label),
-                sanitize_experiment_token(value),
-            )
-        )
-    if str(run_tag).strip():
-        parts.append("tag-{}".format(sanitize_experiment_token(run_tag)))
-    return "__".join(parts)
+    return "_".join(parts)
 
 
 def get_artifact_dir(log_dir, kind):

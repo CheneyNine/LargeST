@@ -26,6 +26,7 @@ from src.utils.experiment_naming import build_experiment_dir_name
 from src.utils.graph_algo import normalize_adj_mx
 from src.utils.logging import get_logger
 from src.utils.metrics import masked_mae
+from src.utils.swanlab_tracker import resolve_swanlab_job_type
 
 
 def set_seed(seed):
@@ -168,8 +169,14 @@ def _resolve_node_order_path(args, data_path):
 def _resolve_text_emb_cache_path(args):
     if args.text_emb_cache_path:
         return args.text_emb_cache_path
-    return "/dev/shm/e2cstp_meta_text_emb_{}_{}_d{}.npy".format(
+    data_root = os.getenv("LARGEST_DATA_ROOT", "/public_data/LargeST_data")
+    cache_dir = os.path.join(data_root, "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(
+        cache_dir,
+        "e2cstp_meta_text_emb_{}_{}_d{}.npy".format(
         args.dataset, args.years, args.text_dim
+        ),
     )
 
 
@@ -180,6 +187,7 @@ def get_config():
     parser.add_argument("--adj_path", type=str, default="")
     parser.add_argument("--node_num", type=int, default=0)
     parser.add_argument("--run_tag", type=str, default="")
+    parser.add_argument("--experiment_timestamp", type=str, default="")
 
     parser.add_argument("--st_dim", type=int, default=3)
     parser.add_argument("--text_dim", type=int, default=0)
@@ -214,6 +222,14 @@ def get_config():
     parser.add_argument("--wdecay", type=float, default=1e-4)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--clip_grad_value", type=float, default=5)
+    parser.add_argument("--use_swanlab", type=int, default=1)
+    parser.add_argument("--swanlab_project", type=str, default="LargeST")
+    parser.add_argument("--swanlab_experiment", type=str, default="")
+    parser.add_argument("--swanlab_mode", type=str, default="cloud")
+    parser.add_argument("--swanlab_description", type=str, default="")
+    parser.add_argument("--desc", dest="swanlab_description", type=str)
+    parser.add_argument("--swanlab_lark_webhook_url", type=str, default=os.getenv("SWANLAB_LARK_WEBHOOK_URL", ""))
+    parser.add_argument("--swanlab_lark_secret", type=str, default=os.getenv("SWANLAB_LARK_SECRET", ""))
     args = parser.parse_args()
 
     total_modal_dim = args.st_dim + args.text_dim + args.image_dim
@@ -227,6 +243,7 @@ def get_config():
         raise ValueError("text_dim must be > 0 when --use_meta_text_prompt=1")
 
     folder_name = build_experiment_dir_name(
+        model_name=args.model_name,
         dataset=args.dataset,
         years=args.years,
         seq_len=args.seq_len,
@@ -239,16 +256,17 @@ def get_config():
             ("meta", int(_bool_flag(args.use_meta_text_prompt))),
         ],
         run_tag=args.run_tag,
+        started_at=str(args.experiment_timestamp).strip() or None,
     )
     log_dir = "./experiments/{}/{}/".format(args.model_name, folder_name)
     logger = get_logger(log_dir, __name__, "record_s{}.log".format(args.seed))
     logger.info(args)
 
-    return args, log_dir, logger
+    return args, log_dir, logger, folder_name
 
 
 def main():
-    args, log_dir, logger = get_config()
+    args, log_dir, logger, folder_name = get_config()
     set_seed(args.seed)
     device = torch.device(args.device)
 
@@ -345,12 +363,29 @@ def main():
         seed=args.seed,
         branch_alpha=args.branch_alpha,
         causal_reg_weight=args.causal_reg_weight,
+        swanlab_cfg={
+            "enabled": bool(args.use_swanlab),
+            "project": args.swanlab_project,
+            "experiment_name": args.swanlab_experiment
+            if args.swanlab_experiment
+            else folder_name,
+            "description": args.swanlab_description,
+            "job_type": resolve_swanlab_job_type(args.mode),
+            "mode": args.swanlab_mode,
+            "logdir": log_dir,
+            "lark_webhook_url": args.swanlab_lark_webhook_url,
+            "lark_secret": args.swanlab_lark_secret,
+            "config": vars(args),
+        },
     )
 
-    if args.mode == "train":
-        engine.train()
-    else:
-        engine.evaluate(args.mode)
+    try:
+        if args.mode == "train":
+            engine.train()
+        else:
+            engine.evaluate(args.mode)
+    finally:
+        engine.close()
 
 
 if __name__ == "__main__":

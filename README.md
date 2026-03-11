@@ -51,7 +51,7 @@ python generate_data_for_training.py --dataset gla --years 2019
 
 
 ## 2. Experiments Running
-We conduct experiments on an Intel(R) Xeon(R) Gold 6140 CPU @ 2.30 GHz, 376 GB RAM computing server, equipped with an NVIDIA RTX A6000 GPU with 48 GB memory. We adopt PyTorch 1.12 as the default deep learning library. Currently, there are a total of 18 supported baselines in this repository, namely, Historical Last (HL), LSTM, [DCRNN](https://github.com/chnsh/DCRNN_PyTorch), [AGCRN](https://github.com/LeiBAI/AGCRN), [STGCN](https://github.com/hazdzz/STGCN), [GWNET](https://github.com/nnzhan/Graph-WaveNet), [ASTGCN](https://github.com/guoshnBJTU/ASTGCN-r-pytorch), [STTN](https://github.com/xumingxingsjtu/STTN), [STGODE](https://github.com/square-coder/STGODE), [DSTAGNN](https://github.com/SYLan2019/DSTAGNN), [DGCRN](https://github.com/tsinghua-fib-lab/Traffic-Benchmark/tree/master/methods/DGCRN), [D2STGNN](https://github.com/zezhishao/D2STGNN), E2-CSTP, TimeCMA, Time-LLM, ST-LLM, CrossTrafficLLM, and STEVE.
+We conduct experiments on an Intel(R) Xeon(R) Gold 6140 CPU @ 2.30 GHz, 376 GB RAM computing server, equipped with an NVIDIA RTX A6000 GPU with 48 GB memory. We adopt PyTorch 1.12 as the default deep learning library. Currently, there are a total of 19 supported baselines in this repository, namely, Historical Last (HL), LSTM, [DCRNN](https://github.com/chnsh/DCRNN_PyTorch), [AGCRN](https://github.com/LeiBAI/AGCRN), [STGCN](https://github.com/hazdzz/STGCN), [GWNET](https://github.com/nnzhan/Graph-WaveNet), [ASTGCN](https://github.com/guoshnBJTU/ASTGCN-r-pytorch), [STTN](https://github.com/xumingxingsjtu/STTN), [STGODE](https://github.com/square-coder/STGODE), [DSTAGNN](https://github.com/SYLan2019/DSTAGNN), [DGCRN](https://github.com/tsinghua-fib-lab/Traffic-Benchmark/tree/master/methods/DGCRN), [D2STGNN](https://github.com/zezhishao/D2STGNN), PatchTST, E2-CSTP, TimeCMA, Time-LLM, ST-LLM, CrossTrafficLLM, and STEVE.
 
 To reproduce the benchmark results in the manuscript, please go to `experiments/baseline_you_want_to_run`, open the provided `run.sh` file, and uncomment the line you would like to execute. Note that you may need to specify the GPU card number on your server. Moreover, we use the flow data from 2019 for model training in our manuscript, if you want to use multiple years of data, please change the years argument to, e.g., 2018_2019.
 
@@ -120,6 +120,16 @@ You can also skip pre-saving and generate embeddings online during training:
 python experiments/timecma/main.py --device cuda:0 --dataset SD --years 2019 --model_name timecma --input_dim 3 --ts_dim 3 --prompt_dim 0 --generate_embeddings_on_the_fly 1 --embedding_method gpt2 --d_llm 768 --external_prompt_dim 768 --prompt_data_name SD --prompt_start_datetime '2019-01-01 00:00:00' --prompt_freq_minutes 5 --run_tag official_online
 ```
 Since TimeCMA uses node-wise attention and prompt generation can be expensive, it is best validated on smaller subsets such as SD first.
+
+To run the PatchTST adaptation, you may execute:
+```
+python experiments/patchtst/main.py --device cuda:0 --dataset SD --years 2019 --model_name patchtst --seed 2023 --bs 64 --seq_len 12 --horizon 12 --input_dim 3 --traffic_dim 3
+```
+For custom Sacramento flow-only data, use:
+```
+python experiments/patchtst/main.py --device cuda:0 --dataset Sacra --years 2023 --model_name patchtst --seed 2023 --bs 16 --seq_len 12 --horizon 12 --input_dim 1 --traffic_dim 1 --data_path /root/XTraffic/data/processed_y2023_sacramento --node_num 517
+```
+This repository version keeps PatchTST's patch-based tokenizer, shared Transformer encoder, flatten prediction head, and optional RevIN normalization, while adapting input/output to the native LargeST tensor format `[B, T, N, F]`.
 
 To run the Time-LLM integration, you may execute:
 ```

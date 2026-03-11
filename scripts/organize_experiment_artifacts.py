@@ -147,13 +147,15 @@ def main():
 
         target_dir = detect_target_dir(root, path)
         bucket = detect_bucket(path)
-        dest = target_dir / "artifacts" / bucket / path.name
+        dest = target_dir / path.name
         if dest.resolve() == path.resolve():
             results.append({"action": "skip-same", "source": str(path)})
             continue
         if dest.exists():
-            results.append({"action": "skip-exists", "source": str(path), "dest": str(dest)})
-            continue
+            dest = target_dir / (path.stem + "__moved" + path.suffix)
+            if dest.exists():
+                results.append({"action": "skip-exists", "source": str(path), "dest": str(dest)})
+                continue
         move_file(path, dest, args.execute)
         results.append({"action": "move", "source": str(path), "dest": str(dest)})
 

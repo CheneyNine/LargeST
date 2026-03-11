@@ -1,6 +1,16 @@
+import os
 import warnings
 
 import numpy as np
+
+
+def resolve_swanlab_job_type(mode):
+    mode = str(mode or "").strip().lower()
+    if mode == "train":
+        return "train"
+    if mode in {"test", "val", "eval", "evaluate"}:
+        return "eval"
+    return "inference"
 
 
 class SwanLabTracker:
@@ -13,6 +23,10 @@ class SwanLabTracker:
         config=None,
         mode="cloud",
         logdir="",
+        description="",
+        job_type="train",
+        lark_webhook_url="",
+        lark_secret="",
     ):
         self._enabled = bool(enabled)
         self._logger = logger
@@ -31,34 +45,72 @@ class SwanLabTracker:
             )
             return
 
-        init_kwargs = {
+        callbacks = []
+        resolved_webhook = str(
+            lark_webhook_url or os.getenv("SWANLAB_LARK_WEBHOOK_URL", "")
+        ).strip()
+        resolved_secret = str(
+            lark_secret or os.getenv("SWANLAB_LARK_SECRET", "")
+        ).strip()
+        if resolved_webhook:
+            try:
+                from swanlab.plugin.notification import LarkCallback
+
+                callbacks.append(
+                    LarkCallback(
+                        webhook_url=resolved_webhook,
+                        secret=resolved_secret,
+                    )
+                )
+            except Exception as error:
+                self._logger.warning(
+                    "SwanLab Lark callback disabled because init failed: {}".format(error)
+                )
+
+        base_kwargs = {
             "project": project,
             "experiment_name": experiment_name,
             "config": config or {},
         }
+        optional_kwargs = {}
         if mode:
-            init_kwargs["mode"] = mode
+            optional_kwargs["mode"] = mode
         if logdir:
-            init_kwargs["logdir"] = logdir
+            optional_kwargs["logdir"] = logdir
+        if str(description).strip():
+            optional_kwargs["description"] = str(description).strip()
+        if str(job_type).strip():
+            optional_kwargs["job_type"] = str(job_type).strip()
+        if callbacks:
+            optional_kwargs["callbacks"] = callbacks
 
-        try:
-            swanlab.init(**init_kwargs)
-        except TypeError:
-            # Fallback for older/newer SwanLab API variants.
-            fallback_kwargs = {
-                "project": project,
-                "experiment_name": experiment_name,
-                "config": config or {},
-            }
+        attempt_kwargs = [
+            dict(base_kwargs, **optional_kwargs),
+            dict(base_kwargs, **{k: v for k, v in optional_kwargs.items() if k != "callbacks"}),
+            dict(base_kwargs, **{k: v for k, v in optional_kwargs.items() if k != "logdir"}),
+            dict(
+                base_kwargs,
+                **{
+                    k: v
+                    for k, v in optional_kwargs.items()
+                    if k not in {"mode", "logdir", "callbacks"}
+                }
+            ),
+            dict(base_kwargs),
+        ]
+
+        last_error = None
+        for init_kwargs in attempt_kwargs:
             try:
-                swanlab.init(**fallback_kwargs)
+                swanlab.init(**init_kwargs)
+                last_error = None
+                break
             except Exception as error:
-                self._logger.warning(
-                    "SwanLab disabled because init failed: {}".format(error)
-                )
-                return
-        except Exception as error:
-            self._logger.warning("SwanLab disabled because init failed: {}".format(error))
+                last_error = error
+                continue
+
+        if last_error is not None:
+            self._logger.warning("SwanLab disabled because init failed: {}".format(last_error))
             return
 
         self._module = swanlab

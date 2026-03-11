@@ -109,5 +109,8 @@ class STEVE_Engine(BaseEngine):
                 test_mape.append(res[1])
                 test_rmse.append(res[2])
 
+            avg_mae, avg_rmse, avg_mape = self._log_test_metrics(
+                test_mae, test_rmse, test_mape
+            )
             log = "Average Test MAE: {:.4f}, Test RMSE: {:.4f}, Test MAPE: {:.4f}"
-            self._logger.info(log.format(np.mean(test_mae), np.mean(test_rmse), np.mean(test_mape)))
+            self._logger.info(log.format(avg_mae, avg_rmse, avg_mape))

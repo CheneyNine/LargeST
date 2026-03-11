@@ -484,6 +484,34 @@ def load_dataset(data_path, args, logger):
     return dataloader, scaler
 
 
+def _resolve_embedding_path(data_path, args, cat, embedding_prefix):
+    candidates = []
+    embedding_dir = str(getattr(args, "embedding_dir", "") or "").strip()
+    if embedding_dir:
+        candidates.append(
+            os.path.join(embedding_dir, '{}_{}.npy'.format(embedding_prefix, cat))
+        )
+        candidates.append(
+            os.path.join(embedding_dir, args.years, '{}_{}.npy'.format(embedding_prefix, cat))
+        )
+    candidates.append(
+        os.path.join(data_path, args.years, '{}_{}.npy'.format(embedding_prefix, cat))
+    )
+    candidates.append(
+        os.path.join(data_path, '{}_{}.npy'.format(embedding_prefix, cat))
+    )
+
+    seen = set()
+    for path in candidates:
+        norm = os.path.normpath(path)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if os.path.exists(norm):
+            return norm, candidates
+    return None, candidates
+
+
 def load_dataset_with_embeddings(data_path, args, logger, embedding_prefix='prompt_emb'):
     ptr = np.load(os.path.join(data_path, args.years, 'his.npz'))
     logger.info('Data shape: ' + str(ptr['data'].shape))
@@ -491,14 +519,16 @@ def load_dataset_with_embeddings(data_path, args, logger, embedding_prefix='prom
     dataloader = {}
     for cat in ['train', 'val', 'test']:
         idx = np.load(os.path.join(data_path, args.years, 'idx_' + cat + '.npy'))
-        embedding_path = os.path.join(
-            data_path, args.years, '{}_{}.npy'.format(embedding_prefix, cat)
+        embedding_path, candidates = _resolve_embedding_path(
+            data_path, args, cat, embedding_prefix
         )
         embeddings = None
-        if os.path.exists(embedding_path):
+        if embedding_path:
             embeddings = np.load(embedding_path)
             logger.info(
-                'Prompt embedding shape for {}: {}'.format(cat, embeddings.shape)
+                'Prompt embedding shape for {}: {} from {}'.format(
+                    cat, embeddings.shape, embedding_path
+                )
             )
             if len(embeddings) != len(idx):
                 raise ValueError(
@@ -508,8 +538,8 @@ def load_dataset_with_embeddings(data_path, args, logger, embedding_prefix='prom
                 )
         else:
             logger.info(
-                'Prompt embedding file not found for {}: {}, fallback to in-model prompt branch'.format(
-                    cat, embedding_path
+                'Prompt embedding file not found for {}. searched: {}. fallback to in-model prompt branch'.format(
+                    cat, candidates
                 )
             )
         idx, sampled = _apply_idx_sampling(

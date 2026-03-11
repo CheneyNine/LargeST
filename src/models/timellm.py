@@ -225,9 +225,9 @@ class TimeLLM(BaseModel):
         self.word_embeddings = self.llm_model.get_input_embeddings().weight
         self.vocab_size = int(self.word_embeddings.shape[0])
         self.num_prototypes = int(num_prototypes)
-        self.mapping_layer = nn.Linear(self.vocab_size, self.num_prototypes).to(
-            dtype=self.word_embeddings.dtype
-        )
+        # Keep trainable mapping weights in fp32 even when the frozen LLM backbone
+        # runs in fp16/bf16. Pure fp16 Adam updates on this layer were unstable.
+        self.mapping_layer = nn.Linear(self.vocab_size, self.num_prototypes)
         self.reprogramming_layer = ReprogrammingLayer(
             d_model=self.d_model,
             n_heads=self.n_heads,
@@ -543,7 +543,11 @@ class TimeLLM(BaseModel):
         prompt_embeddings = self._prompt_embeddings(norm_inputs)
         patch_tokens = self._patchify(norm_inputs)
 
-        source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
+        word_embeddings = self.word_embeddings
+        mapping_dtype = self.mapping_layer.weight.dtype
+        if word_embeddings.dtype != mapping_dtype:
+            word_embeddings = word_embeddings.to(mapping_dtype)
+        source_embeddings = self.mapping_layer(word_embeddings.permute(1, 0)).permute(1, 0)
         if source_embeddings.dtype != patch_tokens.dtype:
             source_embeddings = source_embeddings.to(patch_tokens.dtype)
         reprog_tokens = self.reprogramming_layer(

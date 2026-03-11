@@ -18,6 +18,7 @@ from src.utils.dataloader import load_dataset_with_embeddings
 from src.utils.experiment_naming import build_experiment_dir_name
 from src.utils.logging import get_logger
 from src.utils.metrics import masked_mse
+from src.utils.swanlab_tracker import resolve_swanlab_job_type
 
 
 def set_seed(seed):
@@ -52,16 +53,26 @@ def get_config():
     parser.add_argument("--prompt_start_datetime", type=str, default="")
     parser.add_argument("--use_external_embeddings", type=int, default=0)
     parser.add_argument("--embedding_prefix", type=str, default="prompt_emb")
+    parser.add_argument("--embedding_dir", type=str, default="")
     parser.add_argument("--generate_embeddings_on_the_fly", type=int, default=0)
     parser.add_argument("--embedding_method", type=str, default="gpt2", choices=["gpt2", "stats"])
     parser.add_argument("--data_path", type=str, default="")
     parser.add_argument("--node_num", type=int, default=-1)
     parser.add_argument("--run_tag", type=str, default="")
+    parser.add_argument("--experiment_timestamp", type=str, default="")
 
     parser.add_argument("--lrate", type=float, default=1e-4)
     parser.add_argument("--wdecay", type=float, default=1e-3)
     parser.add_argument("--dropout", type=float, default=0.5)
     parser.add_argument("--clip_grad_value", type=float, default=5)
+    parser.add_argument("--use_swanlab", type=int, default=1)
+    parser.add_argument("--swanlab_project", type=str, default="LargeST")
+    parser.add_argument("--swanlab_experiment", type=str, default="")
+    parser.add_argument("--swanlab_mode", type=str, default="cloud")
+    parser.add_argument("--swanlab_description", type=str, default="")
+    parser.add_argument("--desc", dest="swanlab_description", type=str)
+    parser.add_argument("--swanlab_lark_webhook_url", type=str, default=os.getenv("SWANLAB_LARK_WEBHOOK_URL", ""))
+    parser.add_argument("--swanlab_lark_secret", type=str, default=os.getenv("SWANLAB_LARK_SECRET", ""))
     args = parser.parse_args()
 
     total_dim = args.ts_dim + args.prompt_dim
@@ -87,6 +98,7 @@ def get_config():
             args.prompt_start_datetime = "2019-01-01 00:00:00"
 
     folder_name = build_experiment_dir_name(
+        model_name=args.model_name,
         dataset=args.dataset,
         years=args.years,
         seq_len=args.seq_len,
@@ -102,15 +114,16 @@ def get_config():
             ("drop", args.dropout),
         ],
         run_tag=args.run_tag,
+        started_at=str(args.experiment_timestamp).strip() or None,
     )
     log_dir = "./experiments/{}/{}/".format(args.model_name, folder_name)
     logger = get_logger(log_dir, __name__, "record_s{}.log".format(args.seed))
     logger.info(args)
-    return args, log_dir, logger
+    return args, log_dir, logger, folder_name
 
 
 def main():
-    args, log_dir, logger = get_config()
+    args, log_dir, logger, folder_name = get_config()
     set_seed(args.seed)
     device = torch.device(args.device)
 
@@ -182,12 +195,29 @@ def main():
         embedding_method=args.embedding_method,
         prompt_start_datetime=args.prompt_start_datetime,
         prompt_freq_minutes=args.prompt_freq_minutes,
+        swanlab_cfg={
+            "enabled": bool(args.use_swanlab),
+            "project": args.swanlab_project,
+            "experiment_name": args.swanlab_experiment
+            if args.swanlab_experiment
+            else folder_name,
+            "description": args.swanlab_description,
+            "job_type": resolve_swanlab_job_type(args.mode),
+            "mode": args.swanlab_mode,
+            "logdir": log_dir,
+            "lark_webhook_url": args.swanlab_lark_webhook_url,
+            "lark_secret": args.swanlab_lark_secret,
+            "config": vars(args),
+        },
     )
 
-    if args.mode == "train":
-        engine.train()
-    else:
-        engine.evaluate(args.mode)
+    try:
+        if args.mode == "train":
+            engine.train()
+        else:
+            engine.evaluate(args.mode)
+    finally:
+        engine.close()
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ import torch
 torch.set_num_threads(3)
 
 from src.base.engine import BaseEngine
-from src.models.timellm import TimeLLM
+from src.models.patchtst import PatchTST
 from src.utils.args import get_public_config
 from src.utils.dataloader import get_dataset_info
 from src.utils.dataloader import load_dataset
@@ -35,59 +35,45 @@ def get_config():
     parser.add_argument("--run_tag", type=str, default="")
     parser.add_argument("--experiment_timestamp", type=str, default="")
 
-    parser.add_argument("--traffic_dim", type=int, default=3)
-    parser.add_argument("--d_model", type=int, default=32)
-    parser.add_argument("--llm_dim", type=int, default=768)
-    parser.add_argument("--llm_layers", type=int, default=4)
-    parser.add_argument("--llm_model", type=str, default="GPT2")  # GPT2, BERT, LLAMA
-    parser.add_argument("--llm_model_name", type=str, default="")
-    parser.add_argument("--llm_local_files_only", type=int, default=1)
-    parser.add_argument("--llm_allow_download", type=int, default=1)
-    parser.add_argument("--llm_torch_dtype", type=str, default="float32")
+    parser.add_argument("--traffic_dim", type=int, default=1)
+    parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--n_heads", type=int, default=8)
-    parser.add_argument("--d_ff", type=int, default=128)
-    parser.add_argument("--patch_len", type=int, default=4)
-    parser.add_argument("--stride", type=int, default=2)
-    parser.add_argument("--prompt_len", type=int, default=8)
-    parser.add_argument("--prompt_mode", type=str, default="stats")  # stats, text
-    parser.add_argument("--prompt_granularity", type=str, default="batch")  # batch, node
-    parser.add_argument("--prompt_domain", type=int, default=0)
-    parser.add_argument("--prompt_text", type=str, default="")
-    parser.add_argument("--prompt_max_tokens", type=int, default=96)
-    parser.add_argument("--prompt_batch_size", type=int, default=64)
-    parser.add_argument("--node_chunk_size", type=int, default=32)
-    parser.add_argument("--num_prototypes", type=int, default=1024)
-    parser.add_argument("--top_k_lags", type=int, default=5)
-    parser.add_argument("--freeze_backbone", type=int, default=1)
-    parser.add_argument("--use_revin", type=int, default=1)
+    parser.add_argument("--e_layers", type=int, default=3)
+    parser.add_argument("--d_ff", type=int, default=256)
+    parser.add_argument("--patch_len", type=int, default=16)
+    parser.add_argument("--stride", type=int, default=8)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--fc_dropout", type=float, default=0.1)
+    parser.add_argument("--head_dropout", type=float, default=0.0)
+    parser.add_argument("--revin", type=int, default=1)
+    parser.add_argument("--affine", type=int, default=1)
+    parser.add_argument("--subtract_last", type=int, default=0)
 
     parser.add_argument("--lrate", type=float, default=1e-4)
     parser.add_argument("--wdecay", type=float, default=1e-4)
-    parser.add_argument("--step_size", type=int, default=10)
-    parser.add_argument("--gamma", type=float, default=0.95)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--clip_grad_value", type=float, default=5)
-    parser.add_argument("--log_interval", type=int, default=20)
-    parser.add_argument("--train_sample_stride", type=int, default=1)
-    parser.add_argument("--val_sample_stride", type=int, default=1)
-    parser.add_argument("--test_sample_stride", type=int, default=1)
-    parser.add_argument("--train_sample_limit", type=int, default=0)
-    parser.add_argument("--val_sample_limit", type=int, default=0)
-    parser.add_argument("--test_sample_limit", type=int, default=0)
+    parser.add_argument("--clip_grad_value", type=float, default=5.0)
     parser.add_argument("--use_swanlab", type=int, default=1)
     parser.add_argument("--swanlab_project", type=str, default="LargeST")
     parser.add_argument("--swanlab_experiment", type=str, default="")
     parser.add_argument("--swanlab_mode", type=str, default="cloud")
     parser.add_argument("--swanlab_description", type=str, default="")
     parser.add_argument("--desc", dest="swanlab_description", type=str)
-    parser.add_argument("--swanlab_lark_webhook_url", type=str, default=os.getenv("SWANLAB_LARK_WEBHOOK_URL", ""))
-    parser.add_argument("--swanlab_lark_secret", type=str, default=os.getenv("SWANLAB_LARK_SECRET", ""))
+    parser.add_argument(
+        "--swanlab_lark_webhook_url",
+        type=str,
+        default=os.getenv("SWANLAB_LARK_WEBHOOK_URL", ""),
+    )
+    parser.add_argument(
+        "--swanlab_lark_secret",
+        type=str,
+        default=os.getenv("SWANLAB_LARK_SECRET", ""),
+    )
     args = parser.parse_args()
 
     if args.traffic_dim > args.input_dim:
         raise ValueError(
-            "input_dim must be >= traffic_dim, got {} < {}".format(
-                args.input_dim, args.traffic_dim
+            "traffic_dim must be <= input_dim, got {} > {}".format(
+                args.traffic_dim, args.input_dim
             )
         )
 
@@ -101,8 +87,6 @@ def get_config():
         extra_parts=[
             ("flow", args.traffic_dim),
             ("dm", args.d_model),
-            ("llm", "{}{}".format(str(args.llm_model).lower(), int(args.llm_layers))),
-            ("prompt", str(args.prompt_mode).lower()),
         ],
         run_tag=args.run_tag,
         started_at=str(args.experiment_timestamp).strip() or None,
@@ -136,7 +120,7 @@ def main():
     data_path, node_num = resolve_data_info(args, logger)
     dataloader, scaler = load_dataset(data_path, args, logger)
 
-    model = TimeLLM(
+    model = PatchTST(
         node_num=node_num,
         input_dim=args.input_dim,
         output_dim=args.output_dim,
@@ -144,38 +128,22 @@ def main():
         horizon=args.horizon,
         traffic_dim=args.traffic_dim,
         d_model=args.d_model,
-        llm_dim=args.llm_dim,
-        llm_layers=args.llm_layers,
-        llm_model=args.llm_model,
-        llm_model_name=args.llm_model_name,
-        llm_local_files_only=args.llm_local_files_only,
-        llm_allow_download=args.llm_allow_download,
-        llm_torch_dtype=args.llm_torch_dtype,
         n_heads=args.n_heads,
+        e_layers=args.e_layers,
         d_ff=args.d_ff,
         patch_len=args.patch_len,
         stride=args.stride,
-        prompt_len=args.prompt_len,
-        prompt_mode=args.prompt_mode,
-        prompt_granularity=args.prompt_granularity,
-        prompt_domain=args.prompt_domain,
-        prompt_text=args.prompt_text,
-        prompt_max_tokens=args.prompt_max_tokens,
-        prompt_batch_size=args.prompt_batch_size,
-        node_chunk_size=args.node_chunk_size,
-        num_prototypes=args.num_prototypes,
-        top_k_lags=args.top_k_lags,
-        freeze_backbone=bool(args.freeze_backbone),
-        use_revin=bool(args.use_revin),
         dropout=args.dropout,
-        dataset_name=args.dataset,
+        fc_dropout=args.fc_dropout,
+        head_dropout=args.head_dropout,
+        revin=bool(args.revin),
+        affine=bool(args.affine),
+        subtract_last=bool(args.subtract_last),
     )
 
     loss_fn = masked_mae
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lrate, weight_decay=args.wdecay)
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=args.step_size, gamma=args.gamma
-    )
+    scheduler = None
 
     engine = BaseEngine(
         device=device,
@@ -207,7 +175,6 @@ def main():
             "lark_secret": args.swanlab_lark_secret,
             "config": vars(args),
         },
-        log_interval=args.log_interval,
     )
 
     try:
